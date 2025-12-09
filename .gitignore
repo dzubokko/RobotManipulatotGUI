@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE (ГЛАВНОЕ!)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS
+build/
+devel/
+install/
+log/
+# Локальные файлы
+*.log
+*.tmp
+.env
+
+# Большие файлы
+*.db
+*.sqlite
+*.cache

@@ -1,0 +1,6 @@
+PyQt6>=6.6.0
+rclpy>=0.13.0
+geometry-msgs>=0.6.0
+sensor-msgs>=0.8.0
+std-msgs>=0.5.0
+trajectory-msgs>=0.7.0
