@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+<robot name="robot_debug" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <material name="gray">
+    <color rgba="0.6 0.6 0.6 1.0"/>
+  </material>
+
+  <xacro:macro name="box_link" params="name size mass">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <box size="${size}"/>
+        </geometry>
+        <material name="gray"/>
+      </visual>
+
+      <collision>
+        <geometry>
+          <box size="${size}"/>
+        </geometry>
+      </collision>
+
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="${mass}"/>
+        <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+
+  <xacro:box_link name="base_link" size="0.25 0.25 0.08" mass="2.0"/>
+  <xacro:box_link name="link_1" size="0.10 0.10 0.20" mass="1.0"/>
+  <xacro:box_link name="link_2" size="0.30 0.06 0.06" mass="1.0"/>
+  <xacro:box_link name="link_3" size="0.25 0.06 0.06" mass="1.0"/>
+  <xacro:box_link name="link_4" size="0.15 0.05 0.05" mass="0.8"/>
+  <xacro:box_link name="link_5" size="0.10 0.05 0.05" mass="0.8"/>
+  <xacro:box_link name="link_6" size="0.10 0.08 0.08" mass="0.5"/>
+  <xacro:box_link name="left_finger" size="0.02 0.02 0.10" mass="0.1"/>
+  <xacro:box_link name="right_finger" size="0.02 0.02 0.10" mass="0.1"/>
+  <link name="tool0"/>
+
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="30" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.5" upper="2.5" effort="30" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0.25 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.5" upper="2.5" effort="30" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <origin xyz="0.25 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.14" upper="3.14" effort="20" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <origin xyz="0.15 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.14" upper="3.14" effort="20" velocity="1.0"/>
+  </joint>
+
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/>
+    <child link="link_6"/>
+    <origin xyz="0.10 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="1.0"/>
+  </joint>
+
+  <joint name="left_finger_fixed_joint" type="fixed">
+    <parent link="link_6"/>
+    <child link="left_finger"/>
+    <origin xyz="0.06 0.03 0" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="right_finger_fixed_joint" type="fixed">
+    <parent link="link_6"/>
+    <child link="right_finger"/>
+    <origin xyz="0.06 -0.03 0" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="tool0_fixed_joint" type="fixed">
+    <parent link="link_6"/>
+    <child link="tool0"/>
+    <origin xyz="0.10 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

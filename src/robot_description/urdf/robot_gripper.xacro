@@ -1,0 +1,92 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!--
+    Подвижный захват.
+    left_finger_joint — основной управляемый сустав.
+    right_finger_joint повторяет left_finger_joint через mimic.
+
+    visual = STL
+    collision = простой box, чтобы Gazebo/MoveIt не грузили тяжёлые STL collision.
+  -->
+
+  <xacro:macro name="finger_link" params="name visual_mesh material">
+    <link name="${name}">
+
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh
+            filename="package://robot_description/meshes/visual/${visual_mesh}"
+            scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="${material}"/>
+      </visual>
+
+      <collision>
+        <origin xyz="0 0 0.03" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.015 0.015 0.06"/>
+        </geometry>
+      </collision>
+
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="0.1"/>
+        <inertia
+          ixx="0.001" ixy="0.0" ixz="0.0"
+          iyy="0.001" iyz="0.0"
+          izz="0.001"/>
+      </inertial>
+
+    </link>
+  </xacro:macro>
+
+
+  <!-- ===================== FINGER LINKS ===================== -->
+
+  <xacro:finger_link
+    name="left_finger"
+    visual_mesh="left_finger.STL"
+    material="light_gray"/>
+
+  <xacro:finger_link
+    name="right_finger"
+    visual_mesh="right_finger.STL"
+    material="light_gray"/>
+
+
+  <!-- ===================== FINGER JOINTS ===================== -->
+
+  <joint name="left_finger_joint" type="prismatic">
+    <parent link="link_6"/>
+    <child link="left_finger"/>
+
+    <!-- gripper_base.STL -> left_finger.STL: X=0 mm, Y=0 mm, Z=43.5 mm -->
+    <origin xyz="0 0 0.0435" rpy="1.5708 0 1.5708"/>
+
+    <!-- направление линейного движения пальца -->
+    <axis xyz="0 0 1"/>
+
+    <!-- ход пальца: 0–25 мм -->
+    <limit lower="0.0" upper="0.025" effort="5" velocity="0.05"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="link_6"/>
+    <child link="right_finger"/>
+
+    <!-- gripper_base.STL -> right_finger.STL: X=0 mm, Y=0 mm, Z=43.5 mm -->
+    <origin xyz="0 0 0.0435" rpy="1.5708 0 -1.5708"/>
+
+    <!-- right_finger повторяет left_finger -->
+    <axis xyz="0 0 1"/>
+
+    <limit lower="0.0" upper="0.025" effort="5" velocity="0.05"/>
+    <mimic joint="left_finger_joint" multiplier="1.0" offset="0.0"/>
+
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+</robot>

@@ -1,0 +1,246 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Макрос для временной инерции.
+       Позже эти значения нужно заменить на реальные из SolidWorks. -->
+  <xacro:macro name="default_inertial" params="mass">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="0.01" ixy="0.0" ixz="0.0"
+        iyy="0.01" iyz="0.0"
+        izz="0.01"/>
+    </inertial>
+  </xacro:macro>
+
+  <!--
+    Макрос звена.
+
+    visual = STL, чтобы робот выглядел как твоя CAD-модель.
+    collision = простая геометрия, чтобы Gazebo/MoveIt не зависали на тяжёлых STL.
+  -->
+  <xacro:macro name="robot_link" params="
+    name
+    visual_mesh
+    material
+    mass
+    collision_type
+    collision_xyz
+    collision_rpy
+    collision_size:=''
+    collision_radius:='0'
+    collision_length:='0'
+  ">
+    <link name="${name}">
+
+      <!-- Визуальная модель: оставляем STL -->
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh
+            filename="package://robot_description/meshes/visual/${visual_mesh}"
+            scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="${material}"/>
+      </visual>
+
+      <!-- Упрощённая collision-модель -->
+      <collision>
+        <origin xyz="${collision_xyz}" rpy="${collision_rpy}"/>
+        <geometry>
+          <xacro:if value="${collision_type == 'box'}">
+            <box size="${collision_size}"/>
+          </xacro:if>
+
+          <xacro:if value="${collision_type == 'cylinder'}">
+            <cylinder radius="${collision_radius}" length="${collision_length}"/>
+          </xacro:if>
+        </geometry>
+      </collision>
+
+      <xacro:default_inertial mass="${mass}"/>
+
+    </link>
+  </xacro:macro>
+
+
+  <!-- ===================== LINKS ===================== -->
+
+  <link name="world"/>
+
+  <joint name="world_to_base_fixed" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:robot_link
+    name="base_link"
+    visual_mesh="base.STL"
+    material="dark_gray"
+    mass="2.0"
+    collision_type="box"
+    collision_xyz="0 0 0.035"
+    collision_rpy="0 0 0"
+    collision_size="0.16 0.16 0.07"/>
+
+  <xacro:robot_link
+    name="link_1"
+    visual_mesh="joint_2.STL"
+    material="light_gray"
+    mass="1.0"
+    collision_type="cylinder"
+    collision_xyz="0 0 0.04"
+    collision_rpy="0 0 0"
+    collision_radius="0.05"
+    collision_length="0.08"/>
+
+  <xacro:robot_link
+    name="link_2"
+    visual_mesh="joint_3.STL"
+    material="blue"
+    mass="1.0"
+    collision_type="cylinder"
+    collision_xyz="0 0.11 0"
+    collision_rpy="1.5708 0 0"
+    collision_radius="0.035"
+    collision_length="0.22"/>
+
+  <xacro:robot_link
+    name="link_3"
+    visual_mesh="joint_4.STL"
+    material="light_gray"
+    mass="1.0"
+    collision_type="box"
+    collision_xyz="0.035 0.04 0"
+    collision_rpy="0 0 0"
+    collision_size="0.16 0.08 0.08"/>
+
+  <xacro:robot_link
+    name="link_4"
+    visual_mesh="joint_5.STL"
+    material="blue"
+    mass="0.8"
+    collision_type="cylinder"
+    collision_xyz="0 0 0.086"
+    collision_rpy="0 0 0"
+    collision_radius="0.03"
+    collision_length="0.172"/>
+
+  <xacro:robot_link
+    name="link_5"
+    visual_mesh="joint_6.STL"
+    material="light_gray"
+    mass="0.8"
+    collision_type="cylinder"
+    collision_xyz="0 0.043 0"
+    collision_rpy="1.5708 0 0"
+    collision_radius="0.025"
+    collision_length="0.086"/>
+
+  <!-- gripper_base выполняет финальное вращение, поэтому это link_6 -->
+  <xacro:robot_link
+    name="link_6"
+    visual_mesh="gripper_base.STL"
+    material="orange"
+    mass="0.5"
+    collision_type="cylinder"
+    collision_xyz="0 0 0.043"
+    collision_rpy="0 0 0"
+    collision_radius="0.035"
+    collision_length="0.0867"/>
+
+  <!-- Технический фрейм инструмента -->
+  <link name="tool0"/>
+
+
+  <!-- ===================== JOINTS ===================== -->
+  <!--
+    Все xyz переведены из мм в метры.
+
+    Данные, которые ты дала:
+
+    base.STL -> joint_2.STL:
+    X = 0 мм, Y = 0 мм, Z = 103.8 мм
+
+    joint_2.STL -> joint_3.STL:
+    X = 43.75 мм, Y = 55.8 мм, Z = 80 мм
+    roll = 90 градусов
+
+    joint_3.STL -> joint_4.STL:
+    X = 0 мм, Y = 40 мм, Z = 220 мм
+
+    joint_4.STL -> joint_5.STL:
+    X = 75 мм, Y = 70 мм, Z = 60 мм
+
+    joint_5.STL -> joint_6.STL:
+    X = 0 мм, Y = 0 мм, Z = 172 мм
+
+    joint_6.STL -> gripper_base.STL:
+    X = 0 мм, Y = 0 мм, Z = 85.93 мм
+  -->
+
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="0 0 0.1038" rpy="0 0 3.1416"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="30" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="-0.04375 -0.0558 0.08" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.7854" upper="1.5708" effort="30" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0 0.22 -0.04" rpy="0 3.1416 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5708" upper="1.5708" effort="30" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <origin xyz="0.07 0.075 0.06" rpy="0 1.5708 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.1416" upper="3.1416" effort="20" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <origin xyz="0 0 0.172" rpy="1.5708 0 -1.5708"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.0944" upper="2.0944" effort="10" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/>
+    <child link="link_6"/>
+    <origin xyz="0 0.08593 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="30" velocity="1.0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="tool0_fixed_joint" type="fixed">
+    <parent link="link_6"/>
+    <child link="tool0"/>
+
+    <!-- gripper_base.STL -> tool0: X=0 mm, Y=0 mm, Z=86.7 mm -->
+    <origin xyz="0 0 0.0867" rpy="0 0 0"/>
+  </joint>
+
+</robot>
