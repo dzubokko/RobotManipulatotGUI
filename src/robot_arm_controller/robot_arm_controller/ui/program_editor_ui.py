@@ -701,12 +701,16 @@ class ProgramEditorUI(QWidget):
                 time.sleep(0.01)
         
         elif func_name == "grip_open":
-            self.log(f" 🖐️ Захват открыт")
-            time.sleep(0.5)
-        
+            duration = args[0] if len(args) > 0 else 0.7
+            self.robot.open_gripper(duration)
+            self.log("Захват открыт")
+            time.sleep(duration + 0.1)
+
         elif func_name == "grip_close":
-            self.log(f" ✊ Захват закрыт")
-            time.sleep(0.5)
+            duration = args[0] if len(args) > 0 else 0.7
+            self.robot.close_gripper(duration)
+            self.log("Захват закрыт")
+            time.sleep(duration + 0.1)
         
         elif func_name == "save_ref":
             self.robot.save_reference_orientation()

@@ -1,13 +1,22 @@
 <?xml version="1.0"?>
+
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <!--
-    Подвижный захват.
-    left_finger_joint — основной управляемый сустав.
-    right_finger_joint повторяет left_finger_joint через mimic.
+    Захват робота-манипулятора.
 
-    visual = STL
-    collision = простой box, чтобы Gazebo/MoveIt не грузили тяжёлые STL collision.
+    Логика:
+    0.000 м — закрыто
+    0.025 м — открыто
+
+    Важно:
+    Оси движения у ОБОИХ пальцев заданы как 0 0 -1.
+    Это нужно потому, что при axis="0 0 1" положительное значение 0.025
+    уводило пальцы внутрь друг друга. Инвертируем направление хода у обоих
+    пальцев одновременно, чтобы 0.025 раздвигало пальцы наружу.
+
+    mimic убран, потому что gripper_controller уже управляет двумя суставами:
+    left_finger_joint и right_finger_joint.
   -->
 
   <xacro:macro name="finger_link" params="name visual_mesh material">
@@ -42,7 +51,6 @@
     </link>
   </xacro:macro>
 
-
   <!-- ===================== FINGER LINKS ===================== -->
 
   <xacro:finger_link
@@ -55,37 +63,34 @@
     visual_mesh="right_finger.STL"
     material="light_gray"/>
 
-
-  <!-- ===================== FINGER JOINTS ===================== -->
+  <!-- ===================== LEFT FINGER JOINT ===================== -->
 
   <joint name="left_finger_joint" type="prismatic">
     <parent link="link_6"/>
     <child link="left_finger"/>
 
-    <!-- gripper_base.STL -> left_finger.STL: X=0 mm, Y=0 mm, Z=43.5 mm -->
     <origin xyz="0 0 0.0435" rpy="1.5708 0 1.5708"/>
 
-    <!-- направление линейного движения пальца -->
-    <axis xyz="0 0 1"/>
+    <!-- Инвертированная ось: 0.025 должно открывать, а не вдавливать внутрь -->
+    <axis xyz="0 0 -1"/>
 
-    <!-- ход пальца: 0–25 мм -->
     <limit lower="0.0" upper="0.025" effort="5" velocity="0.05"/>
     <dynamics damping="0.0" friction="0.0"/>
   </joint>
+
+  <!-- ===================== RIGHT FINGER JOINT ===================== -->
 
   <joint name="right_finger_joint" type="prismatic">
     <parent link="link_6"/>
     <child link="right_finger"/>
 
-    <!-- gripper_base.STL -> right_finger.STL: X=0 mm, Y=0 mm, Z=43.5 mm -->
     <origin xyz="0 0 0.0435" rpy="1.5708 0 -1.5708"/>
 
-    <!-- right_finger повторяет left_finger -->
-    <axis xyz="0 0 1"/>
+    <!-- Инвертированная ось у второго пальца ТОЖЕ.
+         Меняем оба пальца, а не один. -->
+    <axis xyz="0 0 -1"/>
 
     <limit lower="0.0" upper="0.025" effort="5" velocity="0.05"/>
-    <mimic joint="left_finger_joint" multiplier="1.0" offset="0.0"/>
-
     <dynamics damping="0.0" friction="0.0"/>
   </joint>
 
