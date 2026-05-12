@@ -711,6 +711,13 @@ class ProgramEditorUI(QWidget):
             self.robot.close_gripper(duration)
             self.log("Захват закрыт")
             time.sleep(duration + 0.1)
+
+        elif func_name == "grip_set":
+            opening = args[0] if len(args) > 0 else 0.0
+            duration = args[1] if len(args) > 1 else 0.7
+            self.robot.set_gripper(opening, duration)
+            self.log(f"Захват установлен: {opening:.3f} м")
+            time.sleep(duration + 0.1)
         
         elif func_name == "save_ref":
             self.robot.save_reference_orientation()

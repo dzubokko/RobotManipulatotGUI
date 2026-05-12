@@ -1,17 +1,3 @@
-from PyQt6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGroupBox,
-    QLabel,
-    QPushButton,
-    QGridLayout,
-    QComboBox,
-    QApplication,
-)
-from PyQt6.QtCore import QTimer, QProcess
-from PyQt6.QtGui import QFont
-
 from pathlib import Path
 from typing import Dict
 
@@ -20,6 +6,20 @@ import os
 import signal
 import subprocess
 
+from PyQt6.QtCore import QProcess, QTimer
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
 
 class ManualControlUI(QWidget):
     def __init__(self, robot_bridge):
@@ -27,14 +27,13 @@ class ManualControlUI(QWidget):
 
         self.robot = robot_bridge
 
-        # Процесс Gazebo, запущенный из приложения
         self.gazebo_process = None
         self.gazebo_pid = None
 
         self.speed_levels = [
-            {"label": "100 мм/с", "scale": 10.0},
-            {"label": "50 мм/с", "scale": 5.0},
-            {"label": "10 мм/с", "scale": 1.0},
+            {"label": "10 мм/с", "scale": 0.5},
+            {"label": "50 мм/с", "scale": 2.5},
+            {"label": "100 мм/с", "scale": 5.0},
         ]
 
         self.speed_idx = 1
@@ -57,12 +56,9 @@ class ManualControlUI(QWidget):
         self.robot.register_callback(self.on_ros_update)
 
         app = QApplication.instance()
+
         if app is not None:
             app.aboutToQuit.connect(self.stop_gazebo_process)
-
-    # ------------------------------------------------------------------
-    # Интерфейс
-    # ------------------------------------------------------------------
 
     def update_speed(self):
         self.robot.speed_scale = self.speed_levels[self.speed_idx]["scale"]
@@ -77,9 +73,9 @@ class ManualControlUI(QWidget):
 
         content = QHBoxLayout()
 
-        # ------------------------------------------------------------------
-        # Левая панель: движение
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # LEFT PANEL
+        # --------------------------------------------------------------
 
         left_panel = QVBoxLayout()
 
@@ -182,9 +178,9 @@ class ManualControlUI(QWidget):
         left_group.setLayout(left_panel)
         content.addWidget(left_group)
 
-        # ------------------------------------------------------------------
-        # Правая панель: статус, скорость, исходная позиция, захват, симуляция
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # RIGHT PANEL
+        # --------------------------------------------------------------
 
         right_group = QGroupBox("СТАТУС И УПРАВЛЕНИЕ")
         right_layout = QVBoxLayout()
@@ -231,6 +227,24 @@ class ManualControlUI(QWidget):
         )
         right_layout.addWidget(self.pose_display)
 
+        gripper_label = QLabel("СОСТОЯНИЕ ЗАХВАТА")
+        gripper_label.setStyleSheet(
+            "font-weight: bold; color: #0078d4; font-size: 11px; margin-top: 10px;"
+        )
+        right_layout.addWidget(gripper_label)
+
+        self.gripper_display = QLabel("Захват: --- mm")
+        self.gripper_display.setStyleSheet(
+            "background-color: #1e1e1e; "
+            "color: #ffaa00; "
+            "padding: 8px; "
+            "border: 1px solid #ffaa00; "
+            "border-radius: 4px; "
+            "font-family: Courier; "
+            "font-size: 10px;"
+        )
+        right_layout.addWidget(self.gripper_display)
+
         speed_label = QLabel("СКОРОСТЬ ПОДАЧИ:")
         speed_label.setStyleSheet(
             "font-weight: bold; color: #ff6600; font-size: 11px; margin-top: 10px;"
@@ -257,7 +271,6 @@ class ManualControlUI(QWidget):
         )
         right_layout.addWidget(self.speed_combo)
 
-        # Исходная позиция
         home_layout = QHBoxLayout()
 
         home_btn = QPushButton("ИСХОДНАЯ ПОЗИЦИЯ")
@@ -267,7 +280,11 @@ class ManualControlUI(QWidget):
 
         right_layout.addLayout(home_layout)
 
-        # Захват
+        fk_tf_btn = QPushButton("ПРОВЕРИТЬ FK/TF")
+        fk_tf_btn.setStyleSheet(self.get_btn_style("#6f42c1"))
+        fk_tf_btn.clicked.connect(self.on_check_fk_tf)
+        right_layout.addWidget(fk_tf_btn)
+
         gripper_group = QGroupBox("ЗАХВАТ")
         gripper_layout = QHBoxLayout(gripper_group)
 
@@ -283,7 +300,6 @@ class ManualControlUI(QWidget):
 
         right_layout.addWidget(gripper_group)
 
-        # Симуляция
         simulation_group = QGroupBox("СИМУЛЯЦИЯ")
         simulation_layout = QVBoxLayout(simulation_group)
 
@@ -333,10 +349,6 @@ class ManualControlUI(QWidget):
         }}
         """
 
-    # ------------------------------------------------------------------
-    # Ручное управление
-    # ------------------------------------------------------------------
-
     def on_speed_changed(self, index: int):
         self.speed_idx = index
         self.update_speed()
@@ -379,6 +391,23 @@ class ManualControlUI(QWidget):
 
     def on_home(self):
         self.robot.reset_position()
+
+    def on_check_fk_tf(self):
+        result = self.robot.check_fk_against_tf()
+
+        if result is None:
+            print("[FK/TF] Проверка не выполнена. TF недоступен.")
+            return
+
+        print(
+            "[FK/TF] "
+            f"FK=({result['fk_x']:.4f}, {result['fk_y']:.4f}, {result['fk_z']:.4f}) m | "
+            f"TF=({result['tf_x']:.4f}, {result['tf_y']:.4f}, {result['tf_z']:.4f}) m | "
+            f"error_x={result['error_x_mm']:.2f} mm, "
+            f"error_y={result['error_y_mm']:.2f} mm, "
+            f"error_z={result['error_z_mm']:.2f} mm, "
+            f"total={result['error_total_mm']:.2f} mm"
+        )
 
     def on_gripper_open(self):
         self.robot.open_gripper(0.7)
@@ -423,14 +452,10 @@ class ManualControlUI(QWidget):
                 duration=0.05,
             )
 
-    # ------------------------------------------------------------------
-    # Обновление данных от ROS
-    # ------------------------------------------------------------------
-
     def on_ros_update(self, data: Dict):
         if "position" in data:
             positions = data["position"]
-            angles_deg = [p * (180.0 / math.pi) for p in positions]
+            angles_deg = [value * (180.0 / math.pi) for value in positions]
 
             status_joints = ""
 
@@ -454,22 +479,25 @@ class ManualControlUI(QWidget):
                 f"RZ: {pose['rz']:7.1f}°"
             )
 
-    # ------------------------------------------------------------------
-    # Запуск и остановка Gazebo из приложения
-    # ------------------------------------------------------------------
+        if "gripper" in data:
+            gripper = data["gripper"]
+
+            if gripper:
+                opening_m = max(gripper)
+                opening_mm = opening_m * 1000.0
+
+                if opening_m < 0.003:
+                    state = "закрыт"
+                elif opening_m > 0.022:
+                    state = "открыт"
+                else:
+                    state = "промежуточно"
+
+                self.gripper_display.setText(
+                    f"Захват: {opening_mm:5.1f} mm | {state}"
+                )
 
     def find_workspace_root(self) -> Path:
-        """
-        Ищет корень рабочего пространства RobotManipulator.
-
-        Ожидаем структуру:
-        RobotManipulator/
-          src/
-            robot_gazebo/
-              launch/
-                gazebo.launch.py
-        """
-
         current_file = Path(__file__).resolve()
 
         for parent in [current_file.parent] + list(current_file.parents):
@@ -487,10 +515,6 @@ class ManualControlUI(QWidget):
         return Path.home() / "RobotManipulator"
 
     def on_start_gazebo(self):
-        """
-        Запуск Gazebo прямо из приложения без всплывающих окон.
-        """
-
         if (
             self.gazebo_process is not None
             and self.gazebo_process.state() != QProcess.ProcessState.NotRunning
@@ -517,10 +541,6 @@ class ManualControlUI(QWidget):
         )
 
         self.gazebo_process = QProcess(self)
-
-        # setsid запускает процесс в отдельной process group.
-        # Это нужно, чтобы кнопка остановки закрывала не только ros2 launch,
-        # но и дочерние процессы Gazebo.
         self.gazebo_process.setProgram("setsid")
         self.gazebo_process.setArguments(["bash", "-lc", command])
 
@@ -547,18 +567,10 @@ class ManualControlUI(QWidget):
         print("[Gazebo] Подожди 10–15 секунд, пока загрузятся робот и контроллеры.")
 
     def on_stop_gazebo(self):
-        """
-        Остановка Gazebo из приложения без всплывающих окон.
-        """
-
         print("[Gazebo] Остановка симуляции...")
         self.stop_gazebo_process()
 
     def stop_gazebo_process(self):
-        """
-        Корректно завершает Gazebo/ros2 launch и дочерние процессы.
-        """
-
         if self.gazebo_process is None:
             self.cleanup_gazebo_processes()
             print("[Gazebo] Активный процесс приложения не найден. Выполнена очистка.")
@@ -571,7 +583,6 @@ class ManualControlUI(QWidget):
             print("[Gazebo] Симуляция уже остановлена.")
             return
 
-        # 1. Пробуем остановить всю process group
         if self.gazebo_pid is not None:
             try:
                 os.killpg(os.getpgid(self.gazebo_pid), signal.SIGTERM)
@@ -581,7 +592,6 @@ class ManualControlUI(QWidget):
             except Exception as exc:
                 print(f"[Gazebo] Не удалось остановить группу процессов: {exc}")
 
-        # 2. Ждём мягкого завершения
         if not self.gazebo_process.waitForFinished(5000):
             print("[Gazebo] Мягкая остановка не сработала. Принудительное завершение...")
 
@@ -595,7 +605,6 @@ class ManualControlUI(QWidget):
             self.gazebo_process.kill()
             self.gazebo_process.waitForFinished(3000)
 
-        # 3. На всякий случай чистим оставшиеся процессы Gazebo
         self.cleanup_gazebo_processes()
 
         self.gazebo_process = None
@@ -604,13 +613,6 @@ class ManualControlUI(QWidget):
         print("[Gazebo] Симуляция остановлена.")
 
     def cleanup_gazebo_processes(self):
-        """
-        Дополнительная очистка зависших процессов Gazebo.
-
-        Нужна потому, что ros2 launch может завершиться,
-        а gzserver/gzclient иногда остаются висеть.
-        """
-
         cleanup_command = (
             "pkill -TERM -f 'ros2 launch robot_gazebo gazebo.launch.py' || true; "
             "pkill -TERM -f 'gzserver' || true; "
@@ -629,19 +631,11 @@ class ManualControlUI(QWidget):
             print(f"[Gazebo] Ошибка при очистке процессов: {exc}")
 
     def on_gazebo_finished(self):
-        """
-        Срабатывает, когда процесс Gazebo завершился сам.
-        """
-
         print("[Gazebo] Процесс симуляции завершён.")
         self.gazebo_process = None
         self.gazebo_pid = None
 
     def on_gazebo_output(self):
-        """
-        Читает вывод Gazebo, чтобы процесс не зависал из-за заполненного буфера.
-        """
-
         if self.gazebo_process is None:
             return
 
