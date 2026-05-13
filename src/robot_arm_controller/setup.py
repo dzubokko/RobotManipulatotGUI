@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 package_name = "robot_arm_controller"
 
@@ -10,9 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
     ],
-    install_requires=[
-        "setuptools",
-    ],
+    install_requires=["setuptools"],
     zip_safe=True,
     maintainer="dzubokko",
     maintainer_email="dzubokko@example.com",
@@ -21,7 +19,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "robot-controller = robot_arm_controller.main:main",
+            "robot-controller = robot_arm_controller.app:main",
         ],
     },
 )

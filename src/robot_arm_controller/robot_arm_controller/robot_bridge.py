@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 import rclpy
@@ -14,32 +15,53 @@ try:
 except ImportError:
     tf2_ros = None
 
+from robot_arm_controller.core.gripper_controller import GripperController
+from robot_arm_controller.core.motion_controller import MotionController
 from robot_arm_controller.core.robot_model import RobotModel
 from robot_arm_controller.core.urdf_kinematics import UrdfKinematics
 
 
 class RobotBridge(Node):
     """
-    ROS 2 bridge между GUI и Gazebo.
+    ROS 2 bridge between the PyQt GUI and the simulated robot.
 
-    Core-рефакторинг эталонной рабочей версии:
-    - ROS publishers/subscribers здесь;
-    - модель робота в core/robot_model.py;
-    - FK/IK в core/urdf_kinematics.py;
-    - движение сохранено близко к рабочей версии;
-    - move_lin улучшен через сегментированную траекторию;
-    - добавлена инженерная проверка FK против /tf.
+    Responsibilities of this class:
+    - ROS publishers/subscribers;
+    - ROS spinning thread;
+    - current state storage;
+    - publishing trajectory messages;
+    - compatibility methods used by the existing UI.
+
+    Kinematics and high-level motion logic are delegated to core modules.
     """
 
-    def __init__(self):
-        super().__init__("robot_arm_controller_v4")
+    def __init__(self) -> None:
+        super().__init__("robot_arm_controller")
 
         self.model = RobotModel()
+        self.model.validate()
+
         self.kin = UrdfKinematics(self.model)
+
+        self.lock = threading.RLock()
+        self.current_position: List[float] = self.model.home_position.copy()
+        self.current_gripper_position: List[float] = [0.0, 0.0]
+
+        self.is_connected: bool = False
+        self.has_joint_states: bool = False
+        self.callbacks: List[Callable[[Dict], None]] = []
+
+        self.speed_scale: float = 1.0
+        self.last_arm_target: Optional[List[float]] = None
+        self.last_gripper_target: Optional[float] = None
+
+        self.motion_state: str = "idle"
+        self.last_command_time: float = 0.0
+        self.last_command_duration: float = 0.0
+        self.e_stop_active: bool = False
 
         self.tf_buffer = None
         self.tf_listener = None
-
         if tf2_ros is not None:
             try:
                 self.tf_buffer = tf2_ros.Buffer()
@@ -50,36 +72,34 @@ class RobotBridge(Node):
         else:
             self.get_logger().warn("tf2_ros is not available. FK/TF check disabled.")
 
-        self.current_position: List[float] = [0.0] * 6
-        self.current_gripper_position: List[float] = [0.0, 0.0]
-
-        self.is_connected: bool = False
-        self.callbacks: List[Callable[[Dict], None]] = []
-        self.lock = threading.Lock()
-
-        self.speed_scale = 1.0
-        self.reference_orientation: Optional[List[List[float]]] = None
-
-        self.last_arm_target: Optional[List[float]] = None
-        self.last_gripper_target: Optional[float] = None
-
         self.trajectory_publisher = self.create_publisher(
             JointTrajectory,
             self.model.arm_topic,
             10,
         )
-
         self.gripper_publisher = self.create_publisher(
             JointTrajectory,
             self.model.gripper_topic,
             10,
         )
-
         self.state_subscriber = self.create_subscription(
             JointState,
             self.model.joint_states_topic,
             self.joint_state_callback,
             10,
+        )
+
+        self.motion = MotionController(
+            model=self.model,
+            kinematics=self.kin,
+            get_current_joints=self.get_current_position,
+            publish_arm_points=self._publish_arm_points,
+            logger=self.get_logger(),
+        )
+        self.gripper = GripperController(
+            model=self.model,
+            publish_gripper_target=self._publish_gripper_target,
+            logger=self.get_logger(),
         )
 
         self.timer = self.create_timer(0.05, self.timer_callback)
@@ -90,81 +110,273 @@ class RobotBridge(Node):
         self.is_connected = True
 
         self.get_logger().info(
-            "RobotBridge core version started. "
+            "RobotBridge started. "
             f"Arm topic={self.model.arm_topic}, joints={self.model.arm_joint_names}. "
-            f"Gripper topic={self.model.gripper_topic}, joints={self.model.gripper_joint_names}."
+            f"Gripper topic={self.model.gripper_topic}, "
+            f"joints={self.model.gripper_joint_names}."
         )
 
-    # ------------------------------------------------------------------
-    # ROS
-    # ------------------------------------------------------------------
-
-    def spin_thread(self):
+    def spin_thread(self) -> None:
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.01)
+            try:
+                rclpy.spin_once(self, timeout_sec=0.01)
+            except Exception as exc:
+                self.get_logger().error(f"ROS spin error: {exc}")
+                time.sleep(0.05)
 
-    def timer_callback(self):
-        pass
+    def timer_callback(self) -> None:
+        self._update_motion_state()
 
-    def joint_state_callback(self, msg: JointState):
-        """
-        Получение фактических положений суставов из /joint_states.
-        """
+    def shutdown(self) -> None:
+        self.is_connected = False
+        try:
+            self.destroy_node()
+        except Exception as exc:
+            self.get_logger().warn(f"destroy_node failed: {exc}")
 
+    def joint_state_callback(self, msg: JointState) -> None:
         with self.lock:
             old_arm = self.current_position.copy()
             old_gripper = self.current_gripper_position.copy()
 
-        arm_positions: List[float] = []
+            arm_positions: List[float] = []
+            for i, joint_name in enumerate(self.model.arm_joint_names):
+                try:
+                    idx = msg.name.index(joint_name)
+                    arm_positions.append(float(msg.position[idx]))
+                except (ValueError, IndexError):
+                    arm_positions.append(old_arm[i])
 
-        for i, joint_name in enumerate(self.model.arm_joint_names):
-            try:
-                idx = msg.name.index(joint_name)
-                arm_positions.append(float(msg.position[idx]))
-            except ValueError:
-                arm_positions.append(old_arm[i])
+            gripper_positions: List[float] = []
+            for i, joint_name in enumerate(self.model.gripper_joint_names):
+                try:
+                    idx = msg.name.index(joint_name)
+                    gripper_positions.append(float(msg.position[idx]))
+                except (ValueError, IndexError):
+                    if i < len(old_gripper):
+                        gripper_positions.append(old_gripper[i])
+                    else:
+                        gripper_positions.append(0.0)
 
-        gripper_positions: List[float] = []
-
-        for i, joint_name in enumerate(self.model.gripper_joint_names):
-            try:
-                idx = msg.name.index(joint_name)
-                gripper_positions.append(float(msg.position[idx]))
-            except ValueError:
-                gripper_positions.append(old_gripper[i])
-
-        with self.lock:
             self.current_position = arm_positions
             self.current_gripper_position = gripper_positions
+            self.has_joint_states = True
 
-        data = {
-            "position": arm_positions,
-            "gripper": gripper_positions,
-            "status": {
-                "connected": self.is_connected,
-                "arm_target": self.last_arm_target,
-                "gripper_target": self.last_gripper_target,
-            },
+        data = self.build_state_packet()
+        self.notify_callbacks(data)
+
+    def build_state_packet(self) -> Dict:
+        data: Dict = {
+            "position": self.get_current_position(),
+            "gripper": self.get_current_gripper_position(),
+            "status": self.get_status(),
         }
 
         try:
             data["pose"] = self.get_tcp_pose()
         except Exception as exc:
-            self.get_logger().error(f"get_tcp_pose error in joint_state_callback: {exc}")
+            self.get_logger().error(f"get_tcp_pose error: {exc}")
 
-        self.notify_callbacks(data)
+        return data
+
+    def get_status(self) -> Dict:
+        with self.lock:
+            return {
+                "connected": self.is_connected,
+                "joint_states": self.has_joint_states,
+                "motion_state": self.motion_state,
+                "e_stop_active": self.e_stop_active,
+                "arm_target": (
+                    self.last_arm_target.copy()
+                    if self.last_arm_target is not None
+                    else None
+                ),
+                "gripper_target": self.last_gripper_target,
+            }
 
     @staticmethod
     def duration_from_float(duration_sec: float) -> Duration:
         duration_sec = max(0.0, float(duration_sec))
         sec = int(duration_sec)
         nanosec = int((duration_sec - sec) * 1e9)
-
         return Duration(sec=sec, nanosec=nanosec)
 
-    # ------------------------------------------------------------------
-    # FK / IK wrappers
-    # ------------------------------------------------------------------
+    def _publish_arm_points(
+        self,
+        points: List[List[float]],
+        duration_sec: float,
+        force: bool = False,
+    ) -> bool:
+        if not force and self.e_stop_active:
+            self.get_logger().warn(
+                "Arm command blocked because Emergency Stop is active."
+            )
+            return False
+
+        if not points:
+            self.get_logger().warn("_publish_arm_points called with empty points")
+            return False
+
+        total_duration = max(0.05, float(duration_sec))
+
+        traj = JointTrajectory()
+        traj.joint_names = self.model.arm_joint_names.copy()
+
+        for i, q_in in enumerate(points, start=1):
+            if len(q_in) != self.model.joint_count:
+                self.get_logger().error(
+                    f"Trajectory point expected {self.model.joint_count} values, "
+                    f"got {len(q_in)}"
+                )
+                return False
+
+            q = self.kin.clamp_to_joint_limits([float(value) for value in q_in])
+
+            point = JointTrajectoryPoint()
+            point.positions = q
+            point.time_from_start = self.duration_from_float(
+                total_duration * i / len(points)
+            )
+            traj.points.append(point)
+
+        final_target = list(traj.points[-1].positions)
+
+        with self.lock:
+            self.last_arm_target = final_target
+            self.last_command_time = time.monotonic()
+            self.last_command_duration = total_duration
+            self.motion_state = "moving"
+
+        self.get_logger().info(
+            "Publishing arm trajectory: "
+            f"points={len(traj.points)}, "
+            f"final={[round(v, 4) for v in final_target]}, "
+            f"duration={total_duration:.2f}s"
+        )
+
+        self.trajectory_publisher.publish(traj)
+        self.notify_callbacks(self.build_state_packet())
+        return True
+
+    def _publish_gripper_target(
+        self,
+        opening: float,
+        duration_sec: float,
+        force: bool = False,
+    ) -> bool:
+        if not force and self.e_stop_active:
+            self.get_logger().warn(
+                "Gripper command blocked because Emergency Stop is active."
+            )
+            return False
+
+        opening = self.model.clamp_gripper_opening(opening)
+        duration_sec = max(0.05, float(duration_sec))
+
+        traj = JointTrajectory()
+        traj.joint_names = self.model.gripper_joint_names.copy()
+
+        point = JointTrajectoryPoint()
+        point.positions = [opening for _ in self.model.gripper_joint_names]
+        point.time_from_start = self.duration_from_float(duration_sec)
+        traj.points.append(point)
+
+        with self.lock:
+            self.last_gripper_target = opening
+
+        self.get_logger().info(
+            "Publishing gripper trajectory: "
+            f"opening={opening:.4f} m, duration={duration_sec:.2f}s"
+        )
+
+        self.gripper_publisher.publish(traj)
+        self.notify_callbacks(self.build_state_packet())
+        return True
+
+    def _update_motion_state(self) -> None:
+        with self.lock:
+            if self.e_stop_active:
+                self.motion_state = "estop"
+                return
+
+            target = self.last_arm_target.copy() if self.last_arm_target else None
+            current = self.current_position.copy()
+            started_at = self.last_command_time
+            planned_duration = self.last_command_duration
+            state = self.motion_state
+
+        if target is None or state not in ("moving", "timeout"):
+            return
+
+        error = max(abs(current[i] - target[i]) for i in range(self.model.joint_count))
+        if error <= self.model.joint_goal_tolerance:
+            with self.lock:
+                self.motion_state = "done"
+            self.notify_callbacks(self.build_state_packet())
+            return
+
+        elapsed = time.monotonic() - started_at
+        timeout = planned_duration + self.model.motion_timeout_margin
+        if elapsed > timeout:
+            with self.lock:
+                self.motion_state = "timeout"
+            self.notify_callbacks(self.build_state_packet())
+
+    def wait_until_arm_reached(
+        self,
+        timeout_sec: Optional[float] = None,
+        tolerance: Optional[float] = None,
+    ) -> bool:
+        tolerance = tolerance or self.model.joint_goal_tolerance
+
+        with self.lock:
+            target = self.last_arm_target.copy() if self.last_arm_target else None
+            duration = self.last_command_duration
+
+        if target is None:
+            return True
+
+        if timeout_sec is None:
+            timeout_sec = duration + self.model.motion_timeout_margin
+
+        start = time.monotonic()
+        while time.monotonic() - start <= timeout_sec:
+            if self.e_stop_active:
+                return False
+
+            current = self.get_current_position()
+            error = max(abs(current[i] - target[i]) for i in range(self.model.joint_count))
+            if error <= tolerance:
+                with self.lock:
+                    self.motion_state = "done"
+                return True
+
+            time.sleep(0.02)
+
+        with self.lock:
+            self.motion_state = "timeout"
+        return False
+
+    def stop_motion(self) -> bool:
+        current = self.get_current_position()
+        with self.lock:
+            self.motion_state = "stopping"
+        return self._publish_arm_points([current], 0.1, force=True)
+
+    def emergency_stop(self) -> None:
+        self.stop_motion()
+        with self.lock:
+            self.e_stop_active = True
+            self.motion_state = "estop"
+        self.get_logger().warn("Emergency Stop activated.")
+        self.notify_callbacks(self.build_state_packet())
+
+    def reset_emergency_stop(self) -> None:
+        with self.lock:
+            self.e_stop_active = False
+            self.motion_state = "idle"
+        self.get_logger().info("Emergency Stop reset.")
+        self.notify_callbacks(self.build_state_packet())
 
     def forward_kinematics(self, joints: List[float]):
         return self.kin.forward_kinematics(joints)
@@ -186,7 +398,7 @@ class RobotBridge(Node):
         duration_hint: float = 0.5,
         keep_orientation: bool = False,
     ):
-        return self.kin.solve_ik(
+        return self.motion.solve_ik(
             target_position=target_position,
             target_rotation=target_rotation,
             initial_joints=initial_joints,
@@ -194,101 +406,19 @@ class RobotBridge(Node):
             keep_orientation=keep_orientation,
         )
 
-    # ------------------------------------------------------------------
-    # Arm trajectory
-    # ------------------------------------------------------------------
-
     def send_trajectory(
         self,
         joint_angles: List[float],
         duration_sec: float = 1.0,
-    ):
-        """
-        Отправка одной точки траектории в arm_controller.
-
-        ВАЖНО:
-        header.stamp не задаём. Нулевой timestamp означает "выполнять сразу".
-        """
-
-        if len(joint_angles) != 6:
-            self.get_logger().error(
-                f"send_trajectory expected 6 joint angles, got {len(joint_angles)}"
-            )
-            return
-
-        q = self.kin.clamp_to_joint_limits([float(v) for v in joint_angles])
-
-        traj = JointTrajectory()
-        traj.joint_names = self.model.arm_joint_names.copy()
-
-        point = JointTrajectoryPoint()
-        point.positions = q
-        point.time_from_start = self.duration_from_float(duration_sec)
-
-        traj.points.append(point)
-
-        self.last_arm_target = q.copy()
-
-        self.get_logger().info(
-            "Publishing arm trajectory: "
-            f"positions={[round(v, 4) for v in q]}, "
-            f"duration={duration_sec:.2f}s"
-        )
-
-        self.trajectory_publisher.publish(traj)
+    ) -> bool:
+        return self.motion.send_joint_target(joint_angles, duration_sec)
 
     def send_trajectory_points(
         self,
         points: List[List[float]],
         duration_sec: float,
-    ):
-        """
-        Отправка многоточечной траектории в arm_controller.
-
-        Используется для сегментированного move_lin:
-        вместо одной конечной точки отправляется несколько промежуточных
-        суставных конфигураций, поэтому TCP движется ближе к прямой.
-        """
-
-        if not points:
-            return
-
-        traj = JointTrajectory()
-        traj.joint_names = self.model.arm_joint_names.copy()
-
-        total = max(0.05, float(duration_sec))
-
-        for i, q in enumerate(points, start=1):
-            if len(q) != 6:
-                self.get_logger().error(
-                    f"Trajectory point expected 6 joint values, got {len(q)}"
-                )
-                return
-
-            q = self.kin.clamp_to_joint_limits(q)
-
-            point = JointTrajectoryPoint()
-            point.positions = q
-
-            t = total * i / len(points)
-            point.time_from_start = self.duration_from_float(t)
-
-            traj.points.append(point)
-
-        self.last_arm_target = list(traj.points[-1].positions)
-
-        self.get_logger().info(
-            "Publishing segmented arm trajectory: "
-            f"points={len(traj.points)}, "
-            f"final={[round(v, 4) for v in self.last_arm_target]}, "
-            f"duration={duration_sec:.2f}s"
-        )
-
-        self.trajectory_publisher.publish(traj)
-
-    # ------------------------------------------------------------------
-    # Cartesian movement
-    # ------------------------------------------------------------------
+    ) -> bool:
+        return self.motion.send_joint_trajectory(points, duration_sec)
 
     def move_end_effector_world(
         self,
@@ -297,371 +427,67 @@ class RobotBridge(Node):
         dz: float = 0.0,
         duration: float = 0.8,
     ) -> bool:
-        """
-        Сегментированное линейное смещение TCP.
-
-        Логика:
-        - для маленьких ручных шагов используется одиночная IK-команда;
-        - для длинных move_lin движение разбивается на промежуточные точки;
-        - ориентация TCP сохраняется как в эталонной рабочей версии;
-        - если сегментированный расчёт почти не дал движения, используется fallback
-          на старую одиночную IK-команду.
-        """
-
-        try:
-            if abs(dx) < 1e-12 and abs(dy) < 1e-12 and abs(dz) < 1e-12:
-                return True
-
-            with self.lock:
-                q_start = self.current_position.copy()
-
-            R_start, p_start = self.forward_kinematics_full(q_start)
-
-            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-            if distance < 0.006 or duration <= 0.15:
-                target_position = [
-                    p_start[0] + dx,
-                    p_start[1] + dy,
-                    p_start[2] + dz,
-                ]
-
-                q_solution, success, pos_error, rot_error = self.solve_ik(
-                    target_position=target_position,
-                    target_rotation=R_start,
-                    initial_joints=q_start,
-                    duration_hint=duration,
-                    keep_orientation=True,
-                )
-
-                self.send_trajectory(q_solution, duration)
-
-                if not success:
-                    self.get_logger().warn(
-                        "IK single move not fully converged: "
-                        f"pos_error={pos_error:.6f}, rot_error={rot_error:.6f}"
-                    )
-
-                return success
-
-            segment_length = 0.008
-            segments = max(2, min(40, math.ceil(distance / segment_length)))
-
-            q_current = q_start.copy()
-            trajectory_points: List[List[float]] = []
-
-            success_all = True
-            max_pos_error = 0.0
-            max_rot_error = 0.0
-
-            for i in range(1, segments + 1):
-                k = i / segments
-
-                target_position = [
-                    p_start[0] + dx * k,
-                    p_start[1] + dy * k,
-                    p_start[2] + dz * k,
-                ]
-
-                q_solution, success, pos_error, rot_error = self.solve_ik(
-                    target_position=target_position,
-                    target_rotation=R_start,
-                    initial_joints=q_current,
-                    duration_hint=duration / segments,
-                    keep_orientation=True,
-                )
-
-                if not success:
-                    success_all = False
-
-                max_pos_error = max(max_pos_error, pos_error)
-                max_rot_error = max(max_rot_error, rot_error)
-
-                q_current = q_solution
-                trajectory_points.append(q_current.copy())
-
-            if not trajectory_points:
-                return False
-
-            delta_sum = sum(
-                abs(trajectory_points[-1][i] - q_start[i])
-                for i in range(6)
-            )
-
-            if delta_sum < 1e-7:
-                self.get_logger().warn(
-                    "Segmented move_lin produced almost no motion. "
-                    "Fallback to single-step IK."
-                )
-
-                target_position = [
-                    p_start[0] + dx,
-                    p_start[1] + dy,
-                    p_start[2] + dz,
-                ]
-
-                q_solution, success, pos_error, rot_error = self.solve_ik(
-                    target_position=target_position,
-                    target_rotation=R_start,
-                    initial_joints=q_start,
-                    duration_hint=duration,
-                    keep_orientation=True,
-                )
-
-                self.send_trajectory(q_solution, duration)
-
-                if not success:
-                    self.get_logger().warn(
-                        "Fallback IK not fully converged: "
-                        f"pos_error={pos_error:.6f}, rot_error={rot_error:.6f}"
-                    )
-
-                return success
-
-            self.send_trajectory_points(trajectory_points, duration)
-
-            if not success_all:
-                self.get_logger().warn(
-                    "Segmented move_lin IK warning: "
-                    f"max_pos_error={max_pos_error:.6f} m, "
-                    f"max_rot_error={math.degrees(max_rot_error):.3f} deg"
-                )
-
-            return success_all
-
-        except Exception as exc:
-            self.get_logger().error(f"move_end_effector_world error: {exc}")
-            return False
+        return self.motion.move_end_effector_world(dx, dy, dz, duration)
 
     def rotate_end_effector_rx_ry_ik(
         self,
         d_rx: float = 0.0,
         d_ry: float = 0.0,
         duration: float = 0.1,
+        **kwargs,
     ) -> bool:
-        try:
-            if abs(d_rx) < 1e-12 and abs(d_ry) < 1e-12:
-                return True
-
-            with self.lock:
-                q_start = self.current_position.copy()
-
-            R_start, p_start = self.forward_kinematics_full(q_start)
-
-            R_delta_x = self.kin.rot_x(d_rx)
-            R_delta_y = self.kin.rot_y(d_ry)
-            R_delta = self.kin.matmul3(R_delta_x, R_delta_y)
-
-            R_target = self.kin.matmul3(R_start, R_delta)
-
-            q_solution, success, pos_error, rot_error = self.solve_ik(
-                target_position=p_start,
-                target_rotation=R_target,
-                initial_joints=q_start,
-                duration_hint=duration,
-                keep_orientation=False,
-            )
-
-            self.send_trajectory(q_solution, duration)
-
-            if not success:
-                self.get_logger().warn(
-                    "IK RX/RY rotation not fully converged: "
-                    f"pos_error={pos_error:.6f}, rot_error={rot_error:.6f}"
-                )
-
-            return success
-
-        except Exception as exc:
-            self.get_logger().error(f"rotate_end_effector_rx_ry_ik error: {exc}")
-            return False
+        if "drx" in kwargs:
+            d_rx = kwargs["drx"]
+        if "dry" in kwargs:
+            d_ry = kwargs["dry"]
+        return self.motion.rotate_end_effector_rx_ry_ik(d_rx, d_ry, duration)
 
     def rotate_end_effector_world(
         self,
         drz: float = 0.0,
         duration: float = 0.1,
     ) -> bool:
-        try:
-            if abs(drz) < 1e-12:
-                return True
-
-            with self.lock:
-                q_start = self.current_position.copy()
-
-            R_start, p_start = self.forward_kinematics_full(q_start)
-
-            R_delta = self.kin.rot_z(drz)
-            R_target = self.kin.matmul3(R_start, R_delta)
-
-            q_solution, success, pos_error, rot_error = self.solve_ik(
-                target_position=p_start,
-                target_rotation=R_target,
-                initial_joints=q_start,
-                duration_hint=duration,
-                keep_orientation=False,
-            )
-
-            self.send_trajectory(q_solution, duration)
-
-            if not success:
-                self.get_logger().warn(
-                    "IK RZ rotation not fully converged: "
-                    f"pos_error={pos_error:.6f}, rot_error={rot_error:.6f}"
-                )
-
-            return success
-
-        except Exception as exc:
-            self.get_logger().error(f"rotate_end_effector_world error: {exc}")
-            return False
-
-    # ------------------------------------------------------------------
-    # Joint movement
-    # ------------------------------------------------------------------
+        return self.motion.rotate_end_effector_world(drz, duration)
 
     def move_joint(
         self,
         joint_index: int,
         angle: float,
         duration_sec: float = 0.5,
-    ):
-        """
-        Управление отдельным суставом.
-
-        Поддерживаются:
-        - joint_index = 1..6 для program editor;
-        - joint_index = 0..5 для внутреннего вызова.
-        """
-
-        if 1 <= joint_index <= 6:
-            idx = joint_index - 1
-        elif 0 <= joint_index <= 5:
-            idx = joint_index
-        else:
-            self.get_logger().error(f"Invalid joint index: {joint_index}")
-            return
-
-        with self.lock:
-            q = self.current_position.copy()
-
-        q[idx] = float(angle)
-        q = self.kin.clamp_to_joint_limits(q)
-
-        self.send_trajectory(q, duration_sec)
+    ) -> bool:
+        return self.motion.move_joint(joint_index, angle, duration_sec)
 
     def move_joints_absolute(
         self,
         angles: List[float],
         duration_sec: float = 1.0,
-    ):
-        if len(angles) != 6:
-            self.get_logger().error(
-                f"move_joints_absolute expected 6 angles, got {len(angles)}"
-            )
-            return
+    ) -> bool:
+        return self.motion.move_joints_absolute(angles, duration_sec)
 
-        self.send_trajectory(angles, duration_sec)
+    def reset_position(self) -> bool:
+        return self.motion.reset_position(2.0)
 
-    def reset_position(self):
-        home = [
-            math.radians(0.0),
-            math.radians(0.0),
-            math.radians(0.0),
-            math.radians(0.0),
-            math.radians(0.0),
-            math.radians(0.0),
-        ]
+    def open_gripper(self, duration_sec: float = 0.7) -> bool:
+        return self.gripper.open(duration_sec)
 
-        self.send_trajectory(home, 2.0)
+    def close_gripper(self, duration_sec: float = 0.7) -> bool:
+        return self.gripper.close(duration_sec)
 
-    # ------------------------------------------------------------------
-    # Gripper
-    # ------------------------------------------------------------------
+    def set_gripper(self, opening: float, duration_sec: float = 0.7) -> bool:
+        return self.gripper.set_opening(opening, duration_sec)
 
     def send_gripper_trajectory(
         self,
         opening: float,
         duration_sec: float = 0.7,
-    ):
-        opening = self.kin.clamp(
-            float(opening),
-            self.model.gripper_closed_position,
-            self.model.gripper_open_position,
-        )
+    ) -> bool:
+        return self.gripper.set_opening(opening, duration_sec)
 
-        traj = JointTrajectory()
-        traj.joint_names = self.model.gripper_joint_names.copy()
+    def save_reference_orientation(self) -> None:
+        self.motion.save_reference_orientation()
 
-        point = JointTrajectoryPoint()
-        point.positions = [opening, opening]
-        point.time_from_start = self.duration_from_float(duration_sec)
-
-        traj.points.append(point)
-
-        self.last_gripper_target = opening
-
-        self.get_logger().info(
-            "Publishing gripper trajectory: "
-            f"opening={opening:.4f} m, duration={duration_sec:.2f}s"
-        )
-
-        self.gripper_publisher.publish(traj)
-
-    def open_gripper(self, duration_sec: float = 0.7):
-        self.send_gripper_trajectory(
-            self.model.gripper_open_position,
-            duration_sec,
-        )
-
-    def close_gripper(self, duration_sec: float = 0.7):
-        self.send_gripper_trajectory(
-            self.model.gripper_closed_position,
-            duration_sec,
-        )
-
-    def set_gripper(self, opening: float, duration_sec: float = 0.7):
-        self.send_gripper_trajectory(opening, duration_sec)
-
-    # ------------------------------------------------------------------
-    # Reference orientation
-    # ------------------------------------------------------------------
-
-    def save_reference_orientation(self):
-        R, _ = self.forward_kinematics_full(self.get_current_position())
-        self.reference_orientation = R
-        self.get_logger().info("Reference TCP orientation saved.")
-
-    def align_orientation_to_reference(self, duration_sec: float = 0.3):
-        if self.reference_orientation is None:
-            self.get_logger().warn("Reference orientation is not saved yet.")
-            return False
-
-        with self.lock:
-            q_start = self.current_position.copy()
-
-        _, p_current = self.forward_kinematics_full(q_start)
-
-        q_solution, success, pos_error, rot_error = self.solve_ik(
-            target_position=p_current,
-            target_rotation=self.reference_orientation,
-            initial_joints=q_start,
-            duration_hint=duration_sec,
-            keep_orientation=False,
-        )
-
-        self.send_trajectory(q_solution, duration_sec)
-
-        if not success:
-            self.get_logger().warn(
-                "align_orientation_to_reference not fully converged: "
-                f"pos_error={pos_error:.6f}, rot_error={rot_error:.6f}"
-            )
-
-        return success
-
-    # ------------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------------
+    def align_orientation_to_reference(self, duration_sec: float = 0.3) -> bool:
+        return self.motion.align_orientation_to_reference(duration_sec)
 
     def get_current_position(self) -> List[float]:
         with self.lock:
@@ -704,27 +530,15 @@ class RobotBridge(Node):
             "rz": math.degrees(rz),
         }
 
-    # ------------------------------------------------------------------
-    # FK / TF verification
-    # ------------------------------------------------------------------
-
     def check_fk_against_tf(self) -> Optional[Dict[str, float]]:
-        """
-        Сравнение Python FK с реальным TF base_link -> tool0.
-
-        FK Python показывает, что считает наша математическая модель.
-        TF показывает, что реально публикует robot_state_publisher.
-        Разница показывает ошибку модели.
-        """
-
         if self.tf_buffer is None:
             self.get_logger().warn("TF buffer is not available.")
             return None
 
         try:
             transform = self.tf_buffer.lookup_transform(
-                "base_link",
-                "tool0",
+                self.model.base_frame,
+                self.model.tool_frame,
                 Time(),
             )
 
@@ -732,19 +546,12 @@ class RobotBridge(Node):
             tf_y = transform.transform.translation.y
             tf_z = transform.transform.translation.z
 
-            with self.lock:
-                q = self.current_position.copy()
-
-            _, fk_p = self.forward_kinematics_full(q)
-
-            fk_x = fk_p[0]
-            fk_y = fk_p[1]
-            fk_z = fk_p[2]
+            _, fk_p = self.forward_kinematics_full(self.get_current_position())
+            fk_x, fk_y, fk_z = fk_p
 
             dx = fk_x - tf_x
             dy = fk_y - tf_y
             dz = fk_z - tf_z
-
             error_m = math.sqrt(dx * dx + dy * dy + dz * dz)
 
             result = {
@@ -776,20 +583,12 @@ class RobotBridge(Node):
             self.get_logger().warn(f"FK/TF check failed: {exc}")
             return None
 
-    # ------------------------------------------------------------------
-    # GUI callbacks
-    # ------------------------------------------------------------------
-
-    def register_callback(self, callback: Callable[[Dict], None]):
+    def register_callback(self, callback: Callable[[Dict], None]) -> None:
         self.callbacks.append(callback)
 
-    def notify_callbacks(self, data: Dict):
+    def notify_callbacks(self, data: Dict) -> None:
         for callback in self.callbacks:
             try:
                 callback(data)
             except Exception as exc:
                 self.get_logger().warn(f"GUI callback error: {exc}")
-
-    def shutdown(self):
-        self.is_connected = False
-        self.destroy_node()

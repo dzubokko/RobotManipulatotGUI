@@ -1,782 +1,856 @@
 import time
-import math
-import re
-import json
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import List, Optional
 
-from PyQt6.QtWidgets import *
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from robot_arm_controller.core.program_executor import (
+    ProgramCommand,
+    ProgramParseError,
+    ProgramStopped,
+    RobotProgramExecutor,
+    RobotProgramParser,
+    RobotProgramStorage,
+)
+
+
+class ProgramWorker(QObject):
+    log_signal = pyqtSignal(str, str)
+    progress_signal = pyqtSignal(int, int, str)
+
+    # status:
+    #   "success"
+    #   "stopped"
+    #   "error"
+    finished_signal = pyqtSignal(str, str)
+
+    def __init__(self, executor: RobotProgramExecutor, commands: List[ProgramCommand]):
+        super().__init__()
+        self.executor = executor
+        self.commands = commands
+
+    def run(self) -> None:
+        try:
+            self.executor.run_commands(self.commands)
+            self.finished_signal.emit("success", "Программа завершена успешно.")
+        except ProgramStopped as exc:
+            self.finished_signal.emit("stopped", str(exc))
+        except Exception as exc:
+            self.finished_signal.emit("error", str(exc))
 
 
 class ProgramEditorUI(QWidget):
+    """
+    Editor and runner for .robot programs.
+
+    UI responsibilities:
+    - edit .robot source;
+    - validate source;
+    - save/load/delete programs;
+    - run program in a worker thread;
+    - show execution status and logs.
+
+    Core logic is implemented in core/program_executor.py.
+    """
+
     def __init__(self, robot_controller):
         super().__init__()
+
         self.robot = robot_controller
-        self.execution_context: Dict[str, float] = {}
-        
-        # Путь к папке программ
-        self.programs_dir = Path(
-            "/home/dzubokko/RobotManipulator/src/robot_arm_controller/robot_arm_controller/programs"
-        )
-        self.programs_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        package_root = Path(__file__).resolve().parents[1]
+        self.programs_dir = package_root / "programs"
+
+        self.parser = RobotProgramParser()
+        self.storage = RobotProgramStorage(self.programs_dir)
+
+        self.executor: Optional[RobotProgramExecutor] = None
+        self.worker_thread: Optional[QThread] = None
+        self.worker: Optional[ProgramWorker] = None
+        self.is_running = False
+        self.stop_requested = False
+
         self.init_ui()
-        self.setMinimumSize(900, 700)
-        self.setGeometry(100, 100, 1200, 900)
-    
-    def init_ui(self):
-        main_layout = QVBoxLayout()
-        
-        # Заголовок
-        title = QLabel("РЕДАКТОР ПРОГРАММЫ")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0078d4;")
+
+        self.setMinimumSize(760, 520)
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def init_ui(self) -> None:
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setSpacing(8)
+
+        title = QLabel("РЕДАКТОР .ROBOT-ПРОГРАММ")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: #0078d4; margin-bottom: 4px;")
         main_layout.addWidget(title)
-        
-        # Панель управления
-        control_panel = QGroupBox("УПРАВЛЕНИЕ ПРОГРАММОЙ")
-        control_layout = QHBoxLayout()
-        
+
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.left_panel = self.build_left_panel()
+        self.right_panel = self.build_right_panel()
+
+        self.main_splitter.addWidget(self.left_panel)
+        self.main_splitter.addWidget(self.right_panel)
+
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([330, 1000])
+
+        main_layout.addWidget(self.main_splitter, 1)
+
+        self.setLayout(main_layout)
+
+    def build_left_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(8)
+
+        layout.addWidget(self.build_file_panel())
+        layout.addWidget(self.build_help_panel(), 1)
+
+        return panel
+
+    def build_right_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        editor_block = self.build_editor_panel()
+        bottom_block = self.build_bottom_panel()
+
+        self.vertical_splitter.addWidget(editor_block)
+        self.vertical_splitter.addWidget(bottom_block)
+
+        self.vertical_splitter.setStretchFactor(0, 3)
+        self.vertical_splitter.setStretchFactor(1, 1)
+        self.vertical_splitter.setSizes([560, 260])
+
+        layout.addWidget(self.vertical_splitter, 1)
+
+        return panel
+
+    def build_file_panel(self) -> QGroupBox:
+        group = QGroupBox("ФАЙЛ ПРОГРАММЫ")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
         name_label = QLabel("Имя программы:")
-        name_label.setStyleSheet("font-weight: bold;")
-        control_layout.addWidget(name_label)
-        
+        layout.addWidget(name_label)
+
         self.program_name_input = QLineEdit()
-        self.program_name_input.setPlaceholderText("Введите имя программы...")
-        self.program_name_input.setMaximumWidth(300)
-        control_layout.addWidget(self.program_name_input)
-        
+        self.program_name_input.setPlaceholderText("example_program")
+        layout.addWidget(self.program_name_input)
+
+        buttons_row_1 = QHBoxLayout()
+
         new_btn = QPushButton("Новая")
         new_btn.clicked.connect(self.on_new_program)
-        control_layout.addWidget(new_btn)
-        
+        buttons_row_1.addWidget(new_btn)
+
         open_btn = QPushButton("Открыть")
         open_btn.clicked.connect(self.on_open_program_dialog)
-        control_layout.addWidget(open_btn)
-        
+        buttons_row_1.addWidget(open_btn)
+
+        layout.addLayout(buttons_row_1)
+
+        buttons_row_2 = QHBoxLayout()
+
         save_btn = QPushButton("Сохранить")
         save_btn.clicked.connect(self.on_save_program)
-        save_btn.setStyleSheet("background-color: #28a745;")
-        control_layout.addWidget(save_btn)
-        
+        save_btn.setStyleSheet(self.green_button_style())
+        buttons_row_2.addWidget(save_btn)
+
         delete_btn = QPushButton("Удалить")
         delete_btn.clicked.connect(self.on_delete_program)
-        delete_btn.setStyleSheet("background-color: #dc3545;")
-        control_layout.addWidget(delete_btn)
-        
-        control_layout.addStretch()
-        control_panel.setLayout(control_layout)
-        main_layout.addWidget(control_panel)
-        
-        # Редактор
-        editor_box = QGroupBox("КОД ПРОГРАММЫ")
-        editor_layout = QVBoxLayout()
-        
-        help_label = QLabel(
-            "СИНТАКСИС ПРОГРАММЫ :\n\n"
-            "- ДВИЖЕНИЕ:\n"
-            " move_lin(dx, dy, dz, time)\n"
-            " rotate_rx(angle_deg, time)\n"
-            " rotate_ry(angle_deg, time)\n"
-            " rotate_rz(angle_deg, time)\n\n"
-            "- СУСТАВЫ:\n"
-            " joint_set(idx, angle_deg, time) – установить сустав\n\n"
-            " wait(time_sec) – ожидание\n"
-            " grip_open() / grip_close()\n\n"
-            "- ЦИКЛЫ: for count in range(N):"
+        delete_btn.setStyleSheet(self.red_button_style())
+        buttons_row_2.addWidget(delete_btn)
+
+        layout.addLayout(buttons_row_2)
+
+        return group
+
+    def build_help_panel(self) -> QGroupBox:
+        group = QGroupBox("СПРАВКА ПО КОМАНДАМ")
+        layout = QVBoxLayout(group)
+
+        self.help_display = QPlainTextEdit()
+        self.help_display.setReadOnly(True)
+        self.help_display.setPlainText(
+            "Основные команды:\n"
+            "\n"
+            "reset_home()\n"
+            "reset_home(duration)\n"
+            "\n"
+            "move_lin(dx, dy, dz, duration)\n"
+            "  dx, dy, dz — метры\n"
+            "  duration — секунды\n"
+            "\n"
+            "rotate_rx(angle_deg, duration)\n"
+            "rotate_ry(angle_deg, duration)\n"
+            "rotate_rz(angle_deg, duration)\n"
+            "  angle_deg — градусы\n"
+            "\n"
+            "joint_set(index, angle_deg, duration)\n"
+            "  index: 1..6\n"
+            "\n"
+            "wait(duration)\n"
+            "\n"
+            "grip_open()\n"
+            "grip_open(duration)\n"
+            "grip_close()\n"
+            "grip_close(duration)\n"
+            "grip_set(opening_m, duration)\n"
+            "  opening_m: 0..0.025\n"
+            "\n"
+            "save_ref()\n"
+            "align_to_ref(duration)\n"
+            "\n"
+            "Циклы:\n"
+            "for i in range(3):\n"
+            "    move_lin(0.01, 0, 0, 0.5)\n"
+            "\n"
+            "Переменная цикла:\n"
+            "for i in range(1, 4):\n"
+            "    move_lin($i, 0, 0, 0.5)\n"
         )
-        help_label.setStyleSheet(
-            "color: #666; font-size: 9px; background-color: #f9f9f9; padding: 6px;"
+        self.help_display.setStyleSheet(
+            "background-color: #181818; "
+            "color: #dddddd; "
+            "font-family: Courier; "
+            "font-size: 10px; "
+            "padding: 8px; "
+            "border: 1px solid #333333; "
+            "border-radius: 4px;"
         )
-        editor_layout.addWidget(help_label)
-        
-        self.code_editor = QTextEdit()
-        # self.code_editor.setPlaceholderText(
-        #     "# Пример:\n"
-        #     "move_lin(0.1, 0, 0, 2)\n"
-        #     "wait(1)\n"
-        #     "rotate_rx(45, 1.5)\n"
-        #     "for count in range(3):\n"
-        #     "  move_lin(0.05, 0, 0, 1)\n"
-        #     "  wait(0.5)\n"
-        #     "reset_home()"
-        # )
+        layout.addWidget(self.help_display)
+
+        return group
+
+    def build_editor_panel(self) -> QGroupBox:
+        group = QGroupBox("КОД ПРОГРАММЫ")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+
+        self.code_editor = QPlainTextEdit()
+        self.code_editor.setPlaceholderText(
+            "# Пример программы\n"
+            "reset_home()\n"
+            "wait(0.5)\n"
+            "\n"
+            "move_lin(0.02, 0, 0, 1.0)\n"
+            "wait(0.3)\n"
+            "\n"
+            "rotate_rz(20, 1.0)\n"
+            "wait(0.3)\n"
+            "\n"
+            "grip_open(0.7)\n"
+            "wait(0.5)\n"
+            "grip_close(0.7)\n"
+        )
         self.code_editor.setStyleSheet(
-            "background-color: #2d2d2d; color: #00ff00;"
-            "font-family: 'Courier New', monospace; font-size: 11px; padding: 10px;"
+            "background-color: #2d2d2d; "
+            "color: #00ff00; "
+            "font-family: 'Courier New', monospace; "
+            "font-size: 13px; "
+            "padding: 10px; "
+            "border: 1px solid #444444; "
+            "border-radius: 4px;"
         )
-        self.code_editor.setMinimumHeight(300)
-        editor_layout.addWidget(self.code_editor)
-        
-        editor_box.setLayout(editor_layout)
-        main_layout.addWidget(editor_box)
-        
-        # Панель выполнения
-        execution_box = QGroupBox("ВЫПОЛНЕНИЕ")
-        execution_layout = QHBoxLayout()
-        
-        run_btn = QPushButton("▶️ ВЫПОЛНИТЬ")
-        run_btn.clicked.connect(self.on_run_program)
-        run_btn.setStyleSheet(
-            "background-color: #28a745; font-weight: bold; font-size: 12px; border-radius: 5px;"
+        layout.addWidget(self.code_editor, 1)
+
+        self.validation_display = QPlainTextEdit()
+        self.validation_display.setReadOnly(True)
+        self.validation_display.setMaximumHeight(70)
+        self.validation_display.setStyleSheet(
+            "background-color: #151515; "
+            "color: #dddddd; "
+            "font-family: Courier; "
+            "font-size: 10px; "
+            "padding: 6px; "
+            "border: 1px solid #333333; "
+            "border-radius: 4px;"
         )
-        run_btn.setMinimumHeight(40)
-        execution_layout.addWidget(run_btn)
-        
-        stop_btn = QPushButton("⏹️ ОСТАНОВИТЬ")
-        stop_btn.clicked.connect(self.on_stop_program)
-        stop_btn.setStyleSheet(
-            "background-color: #dc3545; font-weight: bold; font-size: 12px; border-radius: 5px;"
+        layout.addWidget(self.validation_display)
+
+        return group
+
+    def build_bottom_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        layout.addWidget(self.build_execution_panel())
+        layout.addWidget(self.build_terminal_panel())
+        layout.addWidget(self.build_log_panel(), 1)
+
+        return panel
+
+    def build_execution_panel(self) -> QGroupBox:
+        group = QGroupBox("ВЫПОЛНЕНИЕ ПРОГРАММЫ")
+        layout = QHBoxLayout(group)
+
+        validate_btn = QPushButton("ПРОВЕРИТЬ")
+        validate_btn.clicked.connect(self.on_validate_program)
+        validate_btn.setStyleSheet(self.blue_button_style())
+        validate_btn.setMinimumHeight(36)
+        layout.addWidget(validate_btn)
+
+        self.run_btn = QPushButton("▶ ВЫПОЛНИТЬ")
+        self.run_btn.clicked.connect(self.on_run_program)
+        self.run_btn.setStyleSheet(self.green_button_style())
+        self.run_btn.setMinimumHeight(36)
+        layout.addWidget(self.run_btn)
+
+        self.stop_btn = QPushButton("⏹ ОСТАНОВИТЬ")
+        self.stop_btn.clicked.connect(self.on_stop_program)
+        self.stop_btn.setStyleSheet(self.orange_button_style())
+        self.stop_btn.setMinimumHeight(36)
+        self.stop_btn.setEnabled(False)
+        layout.addWidget(self.stop_btn)
+
+        self.status_label = QLabel("Статус: ожидание")
+        self.status_label.setStyleSheet(
+            "font-weight: bold; "
+            "color: #0078d4; "
+            "padding-left: 12px;"
         )
-        stop_btn.setMinimumHeight(40)
-        execution_layout.addWidget(stop_btn)
-        
-        execution_box.setLayout(execution_layout)
-        main_layout.addWidget(execution_box)
-        
-        # Логи
-        main_layout.addWidget(QLabel("ЛОГ ВЫПОЛНЕНИЯ:"))
-        self.log_display = QTextEdit()
-        self.log_display.setReadOnly(True)
-        self.log_display.setMaximumHeight(150)
-        self.log_display.setStyleSheet(
-            "background-color: #1e1e1e; color: #00ff00;"
-            "font-family: 'Courier New', monospace; font-size: 10px;"
-        )
-        main_layout.addWidget(self.log_display)
-        
-        # Терминал
-        term_group = QGroupBox("ТЕРМИНАЛ УПРАВЛЕНИЯ")
-        term_layout = QHBoxLayout()
-        
+        layout.addWidget(self.status_label, 1)
+
+        return group
+
+    def build_terminal_panel(self) -> QGroupBox:
+        group = QGroupBox("ТЕРМИНАЛ ОДНОЙ КОМАНДЫ")
+        layout = QHBoxLayout(group)
+
         self.term_input = QLineEdit()
         self.term_input.setPlaceholderText(
-            "move_lin(0.1, 0, 0, 2) | rotate_rx(45, 1) | wait(1)"
+            "Например: move_lin(0.01, 0, 0, 0.5)"
         )
         self.term_input.returnPressed.connect(self.on_term_execute)
-        term_layout.addWidget(self.term_input)
-        
-        term_exec_btn = QPushButton("▶ Выполнить")
-        term_exec_btn.clicked.connect(self.on_term_execute)
-        term_exec_btn.setStyleSheet("background-color: #0078d4; color: white;")
-        term_layout.addWidget(term_exec_btn)
-        
-        term_group.setLayout(term_layout)
-        main_layout.addWidget(term_group)
-        
-        main_layout.addStretch()
-        self.setLayout(main_layout)
-    
-    # Служебные  
-    def log(self, message: str):
-        ts = time.strftime("%H:%M:%S")
-        self.log_display.append(f"[{ts}] {message}")
-        bar = self.log_display.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        layout.addWidget(self.term_input, 1)
 
-    # Функции программ 
-    def on_new_program(self):
-        """Создать новую программу"""
-        name = self.program_name_input.text().strip()
-        
-        if not name:
-            QMessageBox.warning(self, "Ошибка", "Введите имя программы!")
-            return
-        
-        self.code_editor.clear()
-        self.log(f"✅ Новая программа: {name}")
-    
-    def on_open_program_dialog(self):
-        """Открыть диалог выбора программы"""
-        programs = self._get_programs_list()
-        
-        if not programs:
-            QMessageBox.information(self, "Информация", "Нет сохранённых программ!")
-            return
-        
-        dialog = QDialog(self)
-        dialog.setWindowTitle("📂 Открыть программу")
-        dialog.setGeometry(200, 200, 400, 300)
-        
-        layout = QVBoxLayout()
-        label = QLabel("Выберите программу для открытия:")
-        layout.addWidget(label)
-        
-        program_list = QListWidget()
-        for prog in sorted(programs):
-            program_list.addItem(QListWidgetItem(prog))
-        layout.addWidget(program_list)
-        
-        btn_layout = QHBoxLayout()
-        
-        def open_selected():
-            if program_list.currentItem():
-                selected = program_list.currentItem().text()
-                self._load_program(selected)
-                dialog.close()
-        
-        open_btn = QPushButton("Открыть")
-        open_btn.clicked.connect(open_selected)
-        btn_layout.addWidget(open_btn)
-        
-        cancel_btn = QPushButton("Отмена")
-        cancel_btn.clicked.connect(dialog.close)
-        btn_layout.addWidget(cancel_btn)
-        
-        layout.addLayout(btn_layout)
-        dialog.setLayout(layout)
-        dialog.exec()
-    
-    def _get_programs_list(self) -> List[str]:
-        """Получить список всех программ в папке"""
-        programs: List[str] = []
-        if self.programs_dir.exists():
-            for file in self.programs_dir.glob("*.robot"):
-                programs.append(file.stem)
-        return programs
-    
-    def _load_program(self, program_name: str):
-        """Загрузка .robot (JSON) и отображение только commands как DSL-код"""
-        try:
-            file_path = self.programs_dir / f"{program_name}.robot"
-            
-            if not file_path.exists():
-                self.log(f"❌ Файл не найден: {file_path}")
-                QMessageBox.critical(self, "Ошибка", f"Файл '{program_name}.robot' не найден в {self.programs_dir}")
-                return
-            
-            self.log(f"📂 Читаю файл: {file_path}")
-            
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                self.log(f"📄 Размер файла: {len(content)} байт")
-                data = json.loads(content)
-            
-            commands = data.get("commands", [])
-            
-            if not isinstance(commands, list):
-                raise ValueError("Поле 'commands' должно быть списком")
-            
-            # Преобразуем commands в DSL-текст
-            lines = []
-            for cmd in commands:
-                ctype = cmd.get("type")
-                
-                if ctype == "move":
-                    dx, dy, dz = cmd.get("target", [0, 0, 0])
-                    t = cmd.get("speed", 1.0)
-                    lines.append(f"move_lin({dx}, {dy}, {dz}, {t})")
-                
-                elif ctype == "rotate_rx":
-                    angle = cmd.get("angle", 0.0)
-                    t = cmd.get("duration", 1.0)
-                    lines.append(f"rotate_rx({angle}, {t})")
-                
-                elif ctype == "rotate_ry":
-                    angle = cmd.get("angle", 0.0)
-                    t = cmd.get("duration", 1.0)
-                    lines.append(f"rotate_ry({angle}, {t})")
-                
-                elif ctype == "rotate_rz":
-                    angle = cmd.get("angle", 0.0)
-                    t = cmd.get("duration", 1.0)
-                    lines.append(f"rotate_rz({angle}, {t})")
-                
-                elif ctype == "joint_set":
-                    idx = cmd.get("joint_idx", 0)
-                    angle = cmd.get("angle", 0.0)
-                    t = cmd.get("duration", 1.0)
-                    lines.append(f"joint_set({idx}, {angle}, {t})")
-                
-                elif ctype == "reset_home":
-                    lines.append("reset_home()")
-                
-                elif ctype == "wait":
-                    dur = cmd.get("duration", 1.0)
-                    lines.append(f"wait({dur})")
-                
-                elif ctype == "gripper_open":
-                    lines.append("grip_open()")
-                
-                elif ctype == "gripper_close":
-                    lines.append("grip_close()")
-                
-                elif ctype == "save_ref":
-                    lines.append("save_ref()")
-                
-                elif ctype == "align_to_ref":
-                    dur = cmd.get("duration", 0.3)
-                    lines.append(f"align_to_ref({dur})")
-            
-            self.code_editor.setText("\n".join(lines))
-            self.program_name_input.setText(program_name)
-            self.log(f"✅ Программа загружена: {program_name} ({len(commands)} команд)")
-            QMessageBox.information(self, "Успех", f"Загружена программа: {program_name}\n({len(commands)} команд)")
-        
-        except json.JSONDecodeError as e:
-            error_msg = f"Ошибка парсинга JSON: {e}"
-            self.log(f"❌ {error_msg}")
-            QMessageBox.critical(self, "Ошибка", error_msg)
-        
-        except Exception as e:
-            error_msg = f"Ошибка загрузки: {e}"
-            self.log(f"❌ {error_msg}")
-            QMessageBox.critical(self, "Ошибка", error_msg)
-    
-    def on_save_program(self):
-        """Сохранить программу в JSON (.robot) с полем commands"""
-        program_name = self.program_name_input.text().strip()
-        code = self.code_editor.toPlainText()
-        
-        if not program_name:
-            QMessageBox.warning(self, "Ошибка", "Введите имя программы!")
-            return
-        
-        if not code.strip():
-            QMessageBox.warning(self, "Ошибка", "Программа пуста!")
-            return
-        
-        try:
-            # Проверка имени файла
-            if any(c in program_name for c in r'\/:*?"<>|'):
-                raise ValueError("Имя содержит недопустимые символы")
-            
-            file_path = self.programs_dir / f"{program_name}.robot"
-            
-            # Парсим текст кода в список commands
-            commands = []
-            cmd_id = 1
-            
-            for raw_line in code.splitlines():
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                
-                if line.startswith("move_lin"):
-                    match = re.match(r"move_lin\s*\(\s*([\d.-]+)\s*,\s*([\d.-]+)\s*,\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        dx, dy, dz, t = [float(x) for x in match.groups()]
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "move",
-                            "target": [dx, dy, dz],
-                            "speed": t
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("rotate_rx"):
-                    match = re.match(r"rotate_rx\s*\(\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        angle, duration = [float(x) for x in match.groups()]
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "rotate_rx",
-                            "angle": angle,
-                            "duration": duration
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("rotate_ry"):
-                    match = re.match(r"rotate_ry\s*\(\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        angle, duration = [float(x) for x in match.groups()]
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "rotate_ry",
-                            "angle": angle,
-                            "duration": duration
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("rotate_rz"):
-                    match = re.match(r"rotate_rz\s*\(\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        angle, duration = [float(x) for x in match.groups()]
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "rotate_rz",
-                            "angle": angle,
-                            "duration": duration
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("joint_set"):
-                    match = re.match(r"joint_set\s*\(\s*(\d+)\s*,\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        idx, angle, duration = [float(x) for x in match.groups()]
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "joint_set",
-                            "joint_idx": int(idx),
-                            "angle": angle,
-                            "duration": duration
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("reset_home"):
-                    commands.append({
-                        "id": cmd_id,
-                        "type": "reset_home"
-                    })
-                    cmd_id += 1
-                
-                elif line.startswith("wait"):
-                    match = re.match(r"wait\s*\(\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        duration = float(match.group(1))
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "wait",
-                            "duration": duration
-                        })
-                        cmd_id += 1
-                
-                elif line.startswith("grip_open"):
-                    commands.append({
-                        "id": cmd_id,
-                        "type": "gripper_open"
-                    })
-                    cmd_id += 1
-                
-                elif line.startswith("grip_close"):
-                    commands.append({
-                        "id": cmd_id,
-                        "type": "gripper_close"
-                    })
-                    cmd_id += 1
-                
-                elif line.startswith("save_ref"):
-                    commands.append({
-                        "id": cmd_id,
-                        "type": "save_ref"
-                    })
-                    cmd_id += 1
-                
-                elif line.startswith("align_to_ref"):
-                    match = re.match(r"align_to_ref\s*\(\s*([\d.-]+)\s*\)", line)
-                    if match:
-                        duration = float(match.group(1))
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "align_to_ref",
-                            "duration": duration
-                        })
-                    else:
-                        commands.append({
-                            "id": cmd_id,
-                            "type": "align_to_ref",
-                            "duration": 0.3
-                        })
-                    cmd_id += 1
-            
-            program_data = {
-                "name": program_name,
-                "description": "",
-                "program_type": "sequence",
-                "created_at": datetime.now().isoformat(),
-                "commands": commands,
-                "loop_count": 1
-            }
-            
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(program_data, f, indent=2, ensure_ascii=False)
-            
-            self.log(f"✅ Программа сохранена: {program_name}")
-            self.log(f" Путь: {file_path}")
-            self.log(f" Команд: {len(commands)}")
-            QMessageBox.information(self, "Успех", f"Сохранено: {program_name}")
-        
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Ошибка сохранения: {e}")
-            self.log(f"❌ Ошибка сохранения: {e}")
-    
-    def on_delete_program(self):
-        """Удалить программу"""
-        program_name = self.program_name_input.text().strip()
-        
-        if not program_name:
-            QMessageBox.warning(self, "Ошибка", "Введите имя программы!")
-            return
-        
-        file_path = self.programs_dir / f"{program_name}.robot"
-        
-        if not file_path.exists():
-            QMessageBox.warning(self, "Ошибка", f"Программа '{program_name}' не найдена!")
-            return
-        
-        reply = QMessageBox.question(
-            self, "Удалить программу?",
-            f"Вы уверены, что хотите удалить '{program_name}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        run_btn = QPushButton("Выполнить")
+        run_btn.clicked.connect(self.on_term_execute)
+        run_btn.setStyleSheet(self.blue_button_style())
+        layout.addWidget(run_btn)
+
+        return group
+
+    def build_log_panel(self) -> QGroupBox:
+        group = QGroupBox("ЛОГ ВЫПОЛНЕНИЯ")
+        layout = QVBoxLayout(group)
+
+        self.log_display = QPlainTextEdit()
+        self.log_display.setReadOnly(True)
+        self.log_display.setMaximumBlockCount(500)
+        self.log_display.setStyleSheet(
+            "background-color: #111111; "
+            "color: #d7ffd7; "
+            "font-family: Courier; "
+            "font-size: 10px; "
+            "padding: 8px; "
+            "border: 1px solid #333333; "
+            "border-radius: 4px;"
         )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                file_path.unlink()
-                self.log(f"✅ Программа удалена: {program_name}")
-                self.code_editor.clear()
-                self.program_name_input.clear()
-                QMessageBox.information(self, "Успех", f"Программа удалена!")
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Ошибка удаления: {e}")
-                self.log(f"❌ Ошибка удаления: {e}")
-    
-    # Выполнение программы
-    def on_run_program(self):
-        """Выполнить программу"""
-        code = self.code_editor.toPlainText()
-        
-        if not code.strip():
-            QMessageBox.warning(self, "Ошибка", "Программа пуста!")
+        layout.addWidget(self.log_display, 1)
+
+        clear_btn = QPushButton("Очистить лог")
+        clear_btn.clicked.connect(self.log_display.clear)
+        clear_btn.setStyleSheet(self.blue_button_style())
+        layout.addWidget(clear_btn)
+
+        return group
+
+    # ------------------------------------------------------------------
+    # Styles
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def green_button_style() -> str:
+        return (
+            "QPushButton { "
+            "background-color: #28a745; "
+            "color: white; "
+            "font-weight: bold; "
+            "border-radius: 6px; "
+            "padding: 8px; "
+            "} "
+            "QPushButton:disabled { "
+            "background-color: #666666; "
+            "color: #bbbbbb; "
+            "}"
+        )
+
+    @staticmethod
+    def red_button_style() -> str:
+        return (
+            "QPushButton { "
+            "background-color: #dc3545; "
+            "color: white; "
+            "font-weight: bold; "
+            "border-radius: 6px; "
+            "padding: 8px; "
+            "} "
+            "QPushButton:disabled { "
+            "background-color: #666666; "
+            "color: #bbbbbb; "
+            "}"
+        )
+
+    @staticmethod
+    def orange_button_style() -> str:
+        return (
+            "QPushButton { "
+            "background-color: #fd7e14; "
+            "color: white; "
+            "font-weight: bold; "
+            "border-radius: 6px; "
+            "padding: 8px; "
+            "} "
+            "QPushButton:disabled { "
+            "background-color: #666666; "
+            "color: #bbbbbb; "
+            "}"
+        )
+
+    @staticmethod
+    def blue_button_style() -> str:
+        return (
+            "QPushButton { "
+            "background-color: #0078d4; "
+            "color: white; "
+            "font-weight: bold; "
+            "border-radius: 6px; "
+            "padding: 8px; "
+            "} "
+            "QPushButton:disabled { "
+            "background-color: #666666; "
+            "color: #bbbbbb; "
+            "}"
+        )
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def log(self, message: str, level: str = "INFO") -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_display.appendPlainText(f"[{timestamp}] [{level}] {message}")
+
+        scrollbar = self.log_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def set_status(self, message: str, color: str = "#0078d4") -> None:
+        self.status_label.setText(f"Статус: {message}")
+        self.status_label.setStyleSheet(
+            f"font-weight: bold; "
+            f"color: {color}; "
+            f"padding-left: 12px;"
+        )
+
+    # ------------------------------------------------------------------
+    # File operations
+    # ------------------------------------------------------------------
+
+    def on_new_program(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение активно",
+                "Нельзя создать новую программу во время выполнения.",
+            )
             return
-        
-        self.log_display.clear()
-        self.log("🚀 ВЫПОЛНЕНИЕ ПРОГРАММЫ")
-        self.log("=" * 70)
-        
-        self.execution_context = {}
-        
+
+        self.program_name_input.clear()
+        self.code_editor.clear()
+        self.validation_display.clear()
+        self.log("Создана новая программа.")
+
+    def on_open_program_dialog(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение активно",
+                "Нельзя открыть программу во время выполнения.",
+            )
+            return
+
+        programs = self.storage.list_programs()
+
+        if not programs:
+            QMessageBox.information(
+                self,
+                "Нет программ",
+                "Папка программ пока пустая.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Открыть программу")
+        dialog.resize(400, 320)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Выберите программу:"))
+
+        program_list = QListWidget()
+        for program_name in programs:
+            program_list.addItem(QListWidgetItem(program_name))
+
+        layout.addWidget(program_list)
+
+        buttons = QHBoxLayout()
+
+        open_btn = QPushButton("Открыть")
+        cancel_btn = QPushButton("Отмена")
+
+        buttons.addWidget(open_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+
+        def open_selected() -> None:
+            item = program_list.currentItem()
+
+            if item is None:
+                return
+
+            self.load_program(item.text())
+            dialog.accept()
+
+        open_btn.clicked.connect(open_selected)
+        cancel_btn.clicked.connect(dialog.reject)
+        program_list.itemDoubleClicked.connect(lambda _: open_selected())
+
+        dialog.exec()
+
+    def load_program(self, program_name: str) -> None:
         try:
-            self.execute_program(code)
-            self.log("=" * 70)
-            self.log("✅ Программа завершена успешно!")
-        except Exception as e:
-            self.log("=" * 70)
-            self.log(f"❌ ОШИБКА: {e}")
-    
-    def on_stop_program(self):
-        """Остановить выполнение программы"""
-        self.log("⏹️ Выполнение остановлено пользователем")
-    
-    # Парсер
-    def execute_program(self, code: str):
-        """Парсит и выполняет программу"""
-        lines = []
-        
-        for line in code.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            lines.append(line)
-        
-        if not lines:
-            self.log("⚠️ Программа не содержит команд")
+            source = self.storage.load_program(program_name)
+
+            self.program_name_input.setText(program_name)
+            self.code_editor.setPlainText(source)
+            self.validation_display.clear()
+
+            self.log(f"Программа загружена: {program_name}")
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка загрузки",
+                str(exc),
+            )
+            self.log(f"Ошибка загрузки: {exc}", "ERROR")
+
+    def on_save_program(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение активно",
+                "Нельзя сохранить программу во время выполнения.",
+            )
             return
-        
-        self.log(f"📊 Найдено строк: {len(lines)}")
-        self._execute_block(lines)
-    
-    def _execute_block(self, lines: List[str]) -> None:
-        """Рекурсивно выполняет блок строк"""
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            
-            if line.startswith("for "):
-                self.log(f"🔁 Обнаружен цикл: {line}")
-                i, body_lines = self._parse_for_loop(lines, i)
-                self._execute_for_loop(line, body_lines)
-                continue
-            
-            if "(" in line and ")" in line:
-                self.log(f"▶ {line}")
-                try:
-                    self._execute_function_call(line)
-                    self.log(f" ✅ Выполнено")
-                except Exception as e:
-                    self.log(f" ❌ Ошибка: {e}")
-                    raise
-            
-            i += 1
-    
-    def _parse_for_loop(self, lines: List[str], loop_start_idx: int):
-        """Парсит цикл for и возвращает индекс после цикла и тело цикла"""
-        loop_line = lines[loop_start_idx].strip()
-        
-        match = re.match(r"for\s+(\w+)\s+in\s+range\s*\(\s*(\d+)\s*\)", loop_line)
-        if not match:
-            raise ValueError(f"Неверный синтаксис цикла: {loop_line}")
-        
-        body_lines = []
-        i = loop_start_idx + 1
-        
-        while i < len(lines):
-            line = lines[i]
-            if line and not line[0].isspace():
-                break
-            if line.strip():
-                body_lines.append(line.strip())
-            i += 1
-        
-        return i, body_lines
-    
-    def _execute_for_loop(self, loop_line: str, body_lines: List[str]):
-        """Выполняет цикл for...range()"""
-        match = re.match(r"for\s+(\w+)\s+in\s+range\s*\(\s*(\d+)\s*\)", loop_line)
-        var_name, count_str = match.groups()
-        count = int(count_str)
-        
-        for iteration in range(count):
-            self.log(f" 🔄 Итерация {iteration + 1}/{count}")
-            self.execution_context[var_name] = iteration
-            
-            try:
-                self._execute_block(body_lines)
-            except Exception as e:
-                self.log(f" ❌ Ошибка в цикле: {e}")
-                raise
-    
-    def _execute_function_call(self, func_str: str):
-        """✅ Парсит и выполняет одну функцию с ГРАДУСАМИ"""
-        func_str = func_str.strip()
-        
-        match = re.match(r"(\w+)\s*\((.*)\)", func_str)
-        if not match:
-            raise ValueError(f"Неверный синтаксис функции: {func_str}")
-        
-        func_name, args_str = match.groups()
-        args = self._parse_arguments(args_str)
-        
-        if func_name == "move_lin":
-            if len(args) != 4:
-                raise ValueError(f"move_lin требует 4 аргумента, получено {len(args)}")
-            
-            dx, dy, dz, time_duration = args
-            self.robot.move_end_effector_world(-dx, -dy, dz, time_duration)
-            time.sleep(time_duration + 0.1)
-        
-        elif func_name == "rotate_rx":
-            if len(args) != 2:
-                raise ValueError(f"rotate_rx требует 2 аргумента, получено {len(args)}")
-            
-            # ✅ ГРАДУСЫ → РАДИАНЫ
-            angle_deg, time_duration = args
-            angle_rad = math.radians(angle_deg)
-            self.robot.rotate_end_effector_rx_ry_ik(d_rx=angle_rad, d_ry=0.0, duration=time_duration)
-            time.sleep(time_duration + 0.1)
-        
-        elif func_name == "rotate_ry":
-            if len(args) != 2:
-                raise ValueError(f"rotate_ry требует 2 аргумента, получено {len(args)}")
-            
-            angle_deg, time_duration = args
-            angle_rad = math.radians(angle_deg)
-            self.robot.rotate_end_effector_rx_ry_ik(d_rx=0.0, d_ry=angle_rad, duration=time_duration)
-            time.sleep(time_duration + 0.1)
-        
-        elif func_name == "rotate_rz":
-            if len(args) != 2:
-                raise ValueError(f"rotate_rz требует 2 аргумента, получено {len(args)}")
-            
-            angle_deg, time_duration = args
-            angle_rad = math.radians(angle_deg)
-            self.robot.rotate_end_effector_world(angle_rad, time_duration)
-            time.sleep(time_duration + 0.1)
-        
-        elif func_name == "joint_set":
-            if len(args) != 3:
-                raise ValueError(f"joint_set требует 3 аргумента, получено {len(args)}")
-            
-            idx, angle_deg, time_duration = args
-            angle_rad = math.radians(angle_deg)
-            self.robot.move_joint(int(idx), angle_rad, time_duration)
-            time.sleep(time_duration + 0.1)
-        
-        elif func_name == "reset_home":
-            self.robot.reset_position()
-            self.log(f" 🏠 Возврат в исходную позицию")
-            time.sleep(2.1)
-        
-        elif func_name == "wait":
-            if len(args) != 1:
-                raise ValueError(f"wait требует 1 аргумент, получено {len(args)}")
-            
-            time_val = args[0]
-            self.log(f" ⏳ Ожидание {time_val} сек...")
-            
-            start = time.time()
-            while time.time() - start < time_val:
-                from PyQt6.QtCore import QCoreApplication
-                QCoreApplication.processEvents()
-                time.sleep(0.01)
-        
-        elif func_name == "grip_open":
-            duration = args[0] if len(args) > 0 else 0.7
-            self.robot.open_gripper(duration)
-            self.log("Захват открыт")
-            time.sleep(duration + 0.1)
 
-        elif func_name == "grip_close":
-            duration = args[0] if len(args) > 0 else 0.7
-            self.robot.close_gripper(duration)
-            self.log("Захват закрыт")
-            time.sleep(duration + 0.1)
+        name = self.program_name_input.text().strip()
+        source = self.code_editor.toPlainText()
 
-        elif func_name == "grip_set":
-            opening = args[0] if len(args) > 0 else 0.0
-            duration = args[1] if len(args) > 1 else 0.7
-            self.robot.set_gripper(opening, duration)
-            self.log(f"Захват установлен: {opening:.3f} м")
-            time.sleep(duration + 0.1)
-        
-        elif func_name == "save_ref":
-            self.robot.save_reference_orientation()
-            self.log(f" 💾 Ориентация сохранена")
-            time.sleep(0.2)
-        
-        elif func_name == "align_to_ref":
-            duration = args[0] if len(args) > 0 else 0.3
-            self.robot.align_orientation_to_reference(duration)
-            self.log(f" 🎯 Подравнивание к ориентации")
-            time.sleep(duration + 0.1)
-        
+        if not name:
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Введите имя программы.",
+            )
+            return
+
+        if not source.strip():
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Программа пустая.",
+            )
+            return
+
+        try:
+            commands = self.parser.parse(source)
+            path = self.storage.save_program(name, source, commands)
+
+            self.validation_display.setPlainText(
+                f"OK: программа валидна. Команд: {len(commands)}"
+            )
+            self.log(f"Программа сохранена: {path}")
+
+            QMessageBox.information(
+                self,
+                "Сохранено",
+                f"Программа сохранена:\n{path}",
+            )
+
+        except ProgramParseError as exc:
+            self.validation_display.setPlainText(str(exc))
+            QMessageBox.critical(
+                self,
+                "Ошибка синтаксиса",
+                str(exc),
+            )
+            self.log(f"Ошибка синтаксиса: {exc}", "ERROR")
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка сохранения",
+                str(exc),
+            )
+            self.log(f"Ошибка сохранения: {exc}", "ERROR")
+
+    def on_delete_program(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение активно",
+                "Нельзя удалить программу во время выполнения.",
+            )
+            return
+
+        name = self.program_name_input.text().strip()
+
+        if not name:
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Введите имя программы.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Удалить программу?",
+            f"Удалить программу '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            path = self.storage.delete_program(name)
+
+            self.program_name_input.clear()
+            self.code_editor.clear()
+            self.validation_display.clear()
+
+            self.log(f"Программа удалена: {path}")
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка удаления",
+                str(exc),
+            )
+            self.log(f"Ошибка удаления: {exc}", "ERROR")
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def on_validate_program(self) -> bool:
+        source = self.code_editor.toPlainText()
+
+        ok, messages, commands = self.parser.validate_source(source)
+
+        self.validation_display.setPlainText("\n".join(messages))
+
+        if ok:
+            self.log(f"Проверка успешна. Команд: {len(commands)}")
         else:
-            raise ValueError(f"❓ Неизвестная функция: {func_name}")
-    
-    def _parse_arguments(self, args_str: str) -> List[float]:
-        """Парсит строку аргументов и возвращает список чисел"""
-        if not args_str.strip():
-            return []
-        
-        parts = args_str.split(",")
-        result = []
-        
-        for part in parts:
-            part = part.strip()
-            
-            try:
-                val = float(part)
-                result.append(val)
-            except ValueError:
-                if part.startswith("$"):
-                    var_name = part[1:]
-                    if var_name in self.execution_context:
-                        result.append(float(self.execution_context[var_name]))
-                    else:
-                        raise ValueError(f"Переменная {part} не определена")
-                else:
-                    raise ValueError(f"Неверный аргумент: {part}")
-        
-        return result
-    
-    # Терминал
-    def on_term_execute(self):
-        """Выполнить команду из терминала"""
-        cmd = self.term_input.text().strip()
-        
-        if not cmd:
+            self.log("Проверка не пройдена.", "ERROR")
+
+        return ok
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    def on_run_program(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение уже идёт",
+                "Сначала остановите текущую программу.",
+            )
             return
-        
-        self.log(f"> {cmd}")
-        
+
+        source = self.code_editor.toPlainText()
+
+        if not source.strip():
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Программа пустая.",
+            )
+            return
+
         try:
-            commands = cmd.split("|")
-            for single_cmd in commands:
-                single_cmd = single_cmd.strip()
-                if single_cmd:
-                    self._execute_function_call(single_cmd)
-                    self.log(f" ✅ Выполнено")
-        except Exception as e:
-            self.log(f"❌ {e}")
-        
+            commands = self.parser.parse(source)
+        except ProgramParseError as exc:
+            self.validation_display.setPlainText(str(exc))
+            QMessageBox.critical(
+                self,
+                "Ошибка синтаксиса",
+                str(exc),
+            )
+            self.log(f"Ошибка синтаксиса: {exc}", "ERROR")
+            return
+
+        if not commands:
+            QMessageBox.warning(
+                self,
+                "Нет команд",
+                "Программа не содержит команд.",
+            )
+            return
+
+        self.log_display.clear()
+        self.validation_display.setPlainText(
+            f"OK: программа валидна. Команд: {len(commands)}"
+        )
+
+        self.start_worker(commands)
+
+    def on_term_execute(self) -> None:
+        if self.is_running:
+            QMessageBox.warning(
+                self,
+                "Выполнение активно",
+                "Нельзя выполнить терминальную команду во время выполнения программы.",
+            )
+            return
+
+        command_text = self.term_input.text().strip()
+
+        if not command_text:
+            return
+
+        try:
+            commands = self.parser.parse(command_text)
+        except ProgramParseError as exc:
+            self.log(f"Ошибка команды: {exc}", "ERROR")
+            return
+
         self.term_input.clear()
+        self.start_worker(commands)
+
+    def start_worker(self, commands: List[ProgramCommand]) -> None:
+        self.is_running = True
+        self.stop_requested = False
+
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.set_status("выполнение", "#28a745")
+
+        self.executor = RobotProgramExecutor(
+            robot=self.robot,
+            log_callback=self.on_executor_log,
+            progress_callback=self.on_executor_progress,
+        )
+
+        self.worker_thread = QThread(self)
+        self.worker = ProgramWorker(self.executor, commands)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self.on_worker_progress)
+        self.worker.finished_signal.connect(self.on_worker_finished)
+
+        self.worker.finished_signal.connect(self.worker_thread.quit)
+        self.worker.finished_signal.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+        self.worker_thread.start()
+
+    def on_stop_program(self) -> None:
+        if not self.is_running:
+            return
+
+        self.stop_requested = True
+
+        self.log("Остановка программы пользователем.", "WARN")
+        self.set_status("остановка...", "#fd7e14")
+
+        self.stop_btn.setEnabled(False)
+
+        if self.executor is not None:
+            self.executor.request_stop()
+
+        try:
+            if self.robot is not None and hasattr(self.robot, "stop_motion"):
+                self.robot.stop_motion()
+        except Exception as exc:
+            self.log(f"Ошибка stop_motion: {exc}", "ERROR")
+
+    def on_executor_log(self, message: str, level: str = "INFO") -> None:
+        if self.worker is not None:
+            self.worker.log_signal.emit(message, level)
+
+    def on_executor_progress(
+        self,
+        index: int,
+        total: int,
+        command: ProgramCommand,
+    ) -> None:
+        if self.worker is not None:
+            self.worker.progress_signal.emit(index, total, command.raw)
+
+    def on_worker_progress(self, index: int, total: int, raw: str) -> None:
+        self.set_status(f"команда {index}/{total}: {raw}", "#28a745")
+
+    def on_worker_finished(self, status: str, message: str) -> None:
+        self.is_running = False
+
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+        if status == "success":
+            self.set_status("завершено", "#28a745")
+            self.log(message, "INFO")
+
+        elif status == "stopped":
+            self.set_status("остановлено", "#fd7e14")
+            self.log("Программа остановлена пользователем.", "WARN")
+
+        else:
+            if self.stop_requested:
+                self.set_status("остановлено", "#fd7e14")
+                self.log("Программа остановлена пользователем.", "WARN")
+            else:
+                self.set_status("ошибка", "#dc3545")
+                self.log(message, "ERROR")
+
+        self.stop_requested = False
+        self.executor = None
+        self.worker = None
+        self.worker_thread = None
