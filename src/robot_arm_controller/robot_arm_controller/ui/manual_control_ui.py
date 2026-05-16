@@ -2,6 +2,7 @@ from datetime import datetime
 import math
 import os
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -26,22 +27,34 @@ from PyQt6.QtWidgets import (
 
 class ManualControlUI(QWidget):
     """
-    Manual control panel for the robot manipulator.
+    Вкладка ручного управления роботом.
 
-    Responsibilities:
-    - manual TCP movement;
-    - TCP orientation movement;
-    - gripper open/close;
-    - Gazebo start/stop;
-    - engineering status display;
-    - GUI log panel;
-    - Stop Motion and Emergency Stop buttons.
-
-    Important:
-    ROS callbacks may be called from a non-Qt thread.
-    Therefore, this UI does not update widgets directly from ROS callbacks.
-    Incoming ROS data is buffered and processed by a Qt timer.
+    Возможности:
+    - ручное движение TCP по X/Y/Z;
+    - поворот TCP по RX/RY/RZ;
+    - управление захватом;
+    - запуск/остановка Gazebo;
+    - безопасная очистка Gazebo перед повторным запуском;
+    - запуск Gazebo на свободном порту, если 11345 занят;
+    - системный статус;
+    - скрываемый лог;
+    - Stop Motion;
+    - Emergency Stop;
+    - Reset E-Stop.
     """
+
+    COLOR_BG = "#171717"
+    COLOR_PANEL = "#202020"
+    COLOR_PANEL_2 = "#252525"
+    COLOR_BORDER = "#3a3a3a"
+    COLOR_TEXT = "#f2f2f2"
+    COLOR_MUTED = "#a9a9a9"
+    COLOR_ACCENT = "#0a84ff"
+    COLOR_ACCENT_HOVER = "#1e90ff"
+    COLOR_DANGER = "#d83b3b"
+    COLOR_DANGER_HOVER = "#e94b4b"
+    COLOR_WARNING = "#f59f00"
+    COLOR_LOG = "#101010"
 
     def __init__(self, robot_bridge):
         super().__init__()
@@ -50,6 +63,7 @@ class ManualControlUI(QWidget):
 
         self.gazebo_process = None
         self.gazebo_pid = None
+        self.gazebo_master_uri = None
 
         self.speed_levels = [
             {"label": "10 мм/с", "scale": 0.5},
@@ -77,6 +91,8 @@ class ManualControlUI(QWidget):
         self._ros_data_lock = threading.Lock()
         self._latest_ros_data = None
         self._has_pending_ros_data = False
+
+        self.logs_visible = True
 
         self.move_timer = QTimer(self)
         self.move_timer.setInterval(50)
@@ -115,154 +131,144 @@ class ManualControlUI(QWidget):
     # ------------------------------------------------------------------
 
     def init_ui(self):
-        main_layout = QVBoxLayout(self)
+        self.setStyleSheet(self.base_stylesheet())
 
-        title = QLabel("РУЧНОЕ УПРАВЛЕНИЕ РОБОТОМ-МАНИПУЛЯТОРОМ")
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(10)
+
+        header_layout = QHBoxLayout()
+
+        title = QLabel("РУЧНОЕ УПРАВЛЕНИЕ")
         title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: #0078d4; margin-bottom: 10px;")
-        main_layout.addWidget(title)
+        title.setStyleSheet(f"color: {self.COLOR_TEXT};")
+        header_layout.addWidget(title)
+
+        header_layout.addStretch()
+
+        self.toggle_logs_btn = QPushButton("Скрыть логи")
+        self.toggle_logs_btn.setStyleSheet(self.button_style("secondary"))
+        self.toggle_logs_btn.clicked.connect(self.toggle_logs)
+        header_layout.addWidget(self.toggle_logs_btn)
+
+        main_layout.addLayout(header_layout)
 
         content = QHBoxLayout()
+        content.setSpacing(10)
 
-        left_panel = self.build_left_control_panel()
-        right_panel = self.build_right_status_panel()
-        log_panel = self.build_log_panel()
+        left_panel = self.build_motion_panel()
+        center_panel = self.build_status_panel()
+        self.log_panel = self.build_log_panel()
 
         content.addWidget(left_panel, 1)
-        content.addWidget(right_panel, 1)
-        content.addWidget(log_panel, 1)
+        content.addWidget(center_panel, 1)
+        content.addWidget(self.log_panel, 1)
 
-        main_layout.addLayout(content)
+        main_layout.addLayout(content, 1)
         self.setLayout(main_layout)
 
-    def build_left_control_panel(self) -> QGroupBox:
-        left_group = QGroupBox("РУЧНОЕ ДВИЖЕНИЕ TCP")
-        left_layout = QVBoxLayout(left_group)
+    def build_motion_panel(self) -> QGroupBox:
+        group = QGroupBox("ДВИЖЕНИЕ И БЕЗОПАСНОСТЬ")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
 
-        linear_group = QGroupBox("ЛИНЕЙНОЕ ДВИЖЕНИЕ")
+        linear_group = QGroupBox("Линейное движение TCP")
         linear_layout = QGridLayout(linear_group)
+        linear_layout.setSpacing(8)
 
-        z_plus = QPushButton("Z+")
-        z_plus.setFixedSize(90, 60)
-        z_plus.setStyleSheet(self.get_btn_style("#0078d4"))
+        z_plus = self.make_button("Z+", "primary", 90, 56)
         z_plus.pressed.connect(lambda: self.start_move(0.0, 0.0, +1.0))
         z_plus.released.connect(self.stop_move)
         linear_layout.addWidget(z_plus, 0, 1)
 
-        z_minus = QPushButton("Z-")
-        z_minus.setFixedSize(90, 60)
-        z_minus.setStyleSheet(self.get_btn_style("#0078d4"))
+        z_minus = self.make_button("Z-", "primary", 90, 56)
         z_minus.pressed.connect(lambda: self.start_move(0.0, 0.0, -1.0))
         z_minus.released.connect(self.stop_move)
         linear_layout.addWidget(z_minus, 2, 1)
 
-        y_plus = QPushButton("Y+")
-        y_plus.setFixedSize(90, 60)
-        y_plus.setStyleSheet(self.get_btn_style("#28a745"))
-        y_plus.pressed.connect(lambda: self.start_move(0.0, -1.0, 0.0))
-        y_plus.released.connect(self.stop_move)
-        linear_layout.addWidget(y_plus, 1, 2)
-
-        y_minus = QPushButton("Y-")
-        y_minus.setFixedSize(90, 60)
-        y_minus.setStyleSheet(self.get_btn_style("#28a745"))
-        y_minus.pressed.connect(lambda: self.start_move(0.0, +1.0, 0.0))
+        y_minus = self.make_button("Y-", "primary", 90, 56)
+        y_minus.pressed.connect(lambda: self.start_move(0.0, -1.0, 0.0))
         y_minus.released.connect(self.stop_move)
         linear_layout.addWidget(y_minus, 1, 0)
 
-        x_plus = QPushButton("X+")
-        x_plus.setFixedSize(90, 60)
-        x_plus.setStyleSheet(self.get_btn_style("#dc3545"))
-        x_plus.pressed.connect(lambda: self.start_move(-1.0, 0.0, 0.0))
+        y_plus = self.make_button("Y+", "primary", 90, 56)
+        y_plus.pressed.connect(lambda: self.start_move(0.0, +1.0, 0.0))
+        y_plus.released.connect(self.stop_move)
+        linear_layout.addWidget(y_plus, 1, 2)
+
+        x_plus = self.make_button("X+", "primary", 90, 56)
+        x_plus.pressed.connect(lambda: self.start_move(+1.0, 0.0, 0.0))
         x_plus.released.connect(self.stop_move)
         linear_layout.addWidget(x_plus, 3, 1)
 
-        x_minus = QPushButton("X-")
-        x_minus.setFixedSize(90, 60)
-        x_minus.setStyleSheet(self.get_btn_style("#dc3545"))
-        x_minus.pressed.connect(lambda: self.start_move(+1.0, 0.0, 0.0))
+        x_minus = self.make_button("X-", "primary", 90, 56)
+        x_minus.pressed.connect(lambda: self.start_move(-1.0, 0.0, 0.0))
         x_minus.released.connect(self.stop_move)
         linear_layout.addWidget(x_minus, 4, 1)
 
-        left_layout.addWidget(linear_group)
+        layout.addWidget(linear_group)
 
-        angular_group = QGroupBox("УГЛОВОЙ ПОВОРОТ TCP")
+        angular_group = QGroupBox("Поворот TCP")
         angular_layout = QGridLayout(angular_group)
+        angular_layout.setSpacing(8)
 
-        rx_minus = QPushButton("RX-")
-        rx_minus.setFixedSize(90, 50)
-        rx_minus.setStyleSheet(self.get_btn_style("#ffc107"))
+        rx_minus = self.make_button("RX-", "secondary", 90, 48)
         rx_minus.pressed.connect(lambda: self.start_rotate(+1.0, 0.0, 0.0))
         rx_minus.released.connect(self.stop_rotate)
         angular_layout.addWidget(rx_minus, 0, 0)
 
-        rx_plus = QPushButton("RX+")
-        rx_plus.setFixedSize(90, 50)
-        rx_plus.setStyleSheet(self.get_btn_style("#ffc107"))
+        rx_plus = self.make_button("RX+", "secondary", 90, 48)
         rx_plus.pressed.connect(lambda: self.start_rotate(-1.0, 0.0, 0.0))
         rx_plus.released.connect(self.stop_rotate)
         angular_layout.addWidget(rx_plus, 0, 1)
 
-        ry_minus = QPushButton("RY-")
-        ry_minus.setFixedSize(90, 50)
-        ry_minus.setStyleSheet(self.get_btn_style("#ffc107"))
+        ry_minus = self.make_button("RY-", "secondary", 90, 48)
         ry_minus.pressed.connect(lambda: self.start_rotate(0.0, +1.0, 0.0))
         ry_minus.released.connect(self.stop_rotate)
         angular_layout.addWidget(ry_minus, 1, 0)
 
-        ry_plus = QPushButton("RY+")
-        ry_plus.setFixedSize(90, 50)
-        ry_plus.setStyleSheet(self.get_btn_style("#ffc107"))
+        ry_plus = self.make_button("RY+", "secondary", 90, 48)
         ry_plus.pressed.connect(lambda: self.start_rotate(0.0, -1.0, 0.0))
         ry_plus.released.connect(self.stop_rotate)
         angular_layout.addWidget(ry_plus, 1, 1)
 
-        rz_minus = QPushButton("RZ-")
-        rz_minus.setFixedSize(90, 50)
-        rz_minus.setStyleSheet(self.get_btn_style("#17a2b8"))
+        rz_minus = self.make_button("RZ-", "secondary", 90, 48)
         rz_minus.pressed.connect(lambda: self.start_rotate(0.0, 0.0, +1.0))
         rz_minus.released.connect(self.stop_rotate)
         angular_layout.addWidget(rz_minus, 2, 0)
 
-        rz_plus = QPushButton("RZ+")
-        rz_plus.setFixedSize(90, 50)
-        rz_plus.setStyleSheet(self.get_btn_style("#17a2b8"))
+        rz_plus = self.make_button("RZ+", "secondary", 90, 48)
         rz_plus.pressed.connect(lambda: self.start_rotate(0.0, 0.0, -1.0))
         rz_plus.released.connect(self.stop_rotate)
         angular_layout.addWidget(rz_plus, 2, 1)
 
-        left_layout.addWidget(angular_group)
+        layout.addWidget(angular_group)
 
-        safety_group = QGroupBox("БЕЗОПАСНОСТЬ")
+        safety_group = QGroupBox("Безопасность")
         safety_layout = QVBoxLayout(safety_group)
+        safety_layout.setSpacing(8)
 
-        stop_btn = QPushButton("STOP MOTION")
-        stop_btn.setStyleSheet(self.get_btn_style("#fd7e14"))
+        stop_btn = self.make_button("STOP MOTION", "warning")
         stop_btn.clicked.connect(self.on_stop_motion)
         safety_layout.addWidget(stop_btn)
 
-        estop_btn = QPushButton("EMERGENCY STOP")
-        estop_btn.setStyleSheet(self.get_btn_style("#dc3545"))
+        estop_btn = self.make_button("EMERGENCY STOP", "danger")
         estop_btn.clicked.connect(self.on_emergency_stop)
         safety_layout.addWidget(estop_btn)
 
-        reset_estop_btn = QPushButton("RESET E-STOP")
-        reset_estop_btn.setStyleSheet(self.get_btn_style("#28a745"))
+        reset_estop_btn = self.make_button("RESET E-STOP", "primary")
         reset_estop_btn.clicked.connect(self.on_reset_emergency_stop)
         safety_layout.addWidget(reset_estop_btn)
 
-        left_layout.addWidget(safety_group)
-        left_layout.addStretch()
+        layout.addWidget(safety_group)
+        layout.addStretch()
 
-        return left_group
+        return group
 
-    def build_right_status_panel(self) -> QGroupBox:
-        right_group = QGroupBox("СТАТУС И УПРАВЛЕНИЕ")
-        right_layout = QVBoxLayout(right_group)
-
-        status_title = QLabel("СИСТЕМНЫЙ СТАТУС")
-        status_title.setStyleSheet(self.get_title_label_style())
-        right_layout.addWidget(status_title)
+    def build_status_panel(self) -> QGroupBox:
+        group = QGroupBox("СТАТУС И УПРАВЛЕНИЕ")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
 
         self.system_status_display = QLabel(
             "ROS: ---\n"
@@ -270,234 +276,260 @@ class ManualControlUI(QWidget):
             "Motion: ---\n"
             "E-STOP: ---"
         )
-        self.system_status_display.setStyleSheet(self.get_status_style(False))
-        right_layout.addWidget(self.system_status_display)
-
-        joints_title = QLabel("ТЕКУЩИЕ УГЛЫ СУСТАВОВ")
-        joints_title.setStyleSheet(self.get_title_label_style())
-        right_layout.addWidget(joints_title)
+        self.system_status_display.setStyleSheet(self.info_box_style())
+        layout.addWidget(self.section_title("Системный статус"))
+        layout.addWidget(self.system_status_display)
 
         self.position_display = QLabel(
             "J1: 0.0° J2: 0.0° J3: 0.0°\n"
             "J4: 0.0° J5: 0.0° J6: 0.0°"
         )
-        self.position_display.setStyleSheet(
-            "background-color: #1e1e1e; "
-            "color: #00ff00; "
-            "padding: 10px; "
-            "border: 1px solid #0078d4; "
-            "border-radius: 4px; "
-            "font-family: Courier; "
-            "font-size: 10px;"
-        )
-        right_layout.addWidget(self.position_display)
-
-        pose_title = QLabel("КООРДИНАТЫ TCP")
-        pose_title.setStyleSheet(self.get_title_label_style())
-        right_layout.addWidget(pose_title)
+        self.position_display.setStyleSheet(self.info_box_style(monospace=True))
+        layout.addWidget(self.section_title("Углы суставов"))
+        layout.addWidget(self.position_display)
 
         self.pose_display = QLabel(
             "X: --- mm Y: --- mm Z: --- mm\n"
             "RX: ---° RY: ---° RZ: ---°"
         )
-        self.pose_display.setStyleSheet(
-            "background-color: #1a1a2e; "
-            "color: #00ff88; "
-            "padding: 10px; "
-            "border: 2px solid #00cc66; "
-            "border-radius: 6px; "
-            "font-family: Courier; "
-            "font-size: 10px;"
-        )
-        right_layout.addWidget(self.pose_display)
-
-        gripper_title = QLabel("СОСТОЯНИЕ ЗАХВАТА")
-        gripper_title.setStyleSheet(self.get_title_label_style())
-        right_layout.addWidget(gripper_title)
+        self.pose_display.setStyleSheet(self.info_box_style(monospace=True))
+        layout.addWidget(self.section_title("Координаты TCP"))
+        layout.addWidget(self.pose_display)
 
         self.gripper_display = QLabel("Захват: --- mm")
-        self.gripper_display.setStyleSheet(
-            "background-color: #1e1e1e; "
-            "color: #ffaa00; "
-            "padding: 8px; "
-            "border: 1px solid #ffaa00; "
-            "border-radius: 4px; "
-            "font-family: Courier; "
-            "font-size: 10px;"
-        )
-        right_layout.addWidget(self.gripper_display)
+        self.gripper_display.setStyleSheet(self.info_box_style(monospace=True))
+        layout.addWidget(self.section_title("Захват"))
+        layout.addWidget(self.gripper_display)
 
-        speed_title = QLabel("СКОРОСТЬ ПОДАЧИ")
-        speed_title.setStyleSheet(self.get_title_label_style("#ff6600"))
-        right_layout.addWidget(speed_title)
+        speed_group = QGroupBox("Скорость подачи")
+        speed_layout = QVBoxLayout(speed_group)
 
         self.speed_combo = QComboBox()
         for level in self.speed_levels:
             self.speed_combo.addItem(level["label"])
         self.speed_combo.setCurrentIndex(self.speed_idx)
         self.speed_combo.currentIndexChanged.connect(self.on_speed_changed)
-        self.speed_combo.setStyleSheet(
-            "QComboBox { "
-            "padding: 6px; "
-            "border-radius: 4px; "
-            "background-color: #333333; "
-            "color: white; "
-            "border: 1px solid #555555; "
-            "} "
-            "QComboBox::drop-down { border: none; } "
-            "QComboBox::down-arrow { image: none; }"
-        )
-        right_layout.addWidget(self.speed_combo)
+        self.speed_combo.setStyleSheet(self.combo_style())
+        speed_layout.addWidget(self.speed_combo)
 
-        home_btn = QPushButton("ИСХОДНАЯ ПОЗИЦИЯ")
-        home_btn.setStyleSheet(self.get_btn_style("#28a745"))
+        layout.addWidget(speed_group)
+
+        home_btn = self.make_button("ИСХОДНАЯ ПОЗИЦИЯ", "primary")
         home_btn.clicked.connect(self.on_home)
-        right_layout.addWidget(home_btn)
+        layout.addWidget(home_btn)
 
-        fk_tf_btn = QPushButton("ПРОВЕРИТЬ FK/TF")
-        fk_tf_btn.setStyleSheet(self.get_btn_style("#6f42c1"))
-        fk_tf_btn.clicked.connect(self.on_check_fk_tf)
-        right_layout.addWidget(fk_tf_btn)
-
-        gripper_group = QGroupBox("ЗАХВАТ")
+        gripper_group = QGroupBox("Управление захватом")
         gripper_layout = QHBoxLayout(gripper_group)
 
-        open_gripper_btn = QPushButton("ОТКРЫТЬ")
-        open_gripper_btn.setStyleSheet(self.get_btn_style("#17a2b8"))
+        open_gripper_btn = self.make_button("ОТКРЫТЬ", "secondary")
         open_gripper_btn.clicked.connect(self.on_gripper_open)
         gripper_layout.addWidget(open_gripper_btn)
 
-        close_gripper_btn = QPushButton("ЗАКРЫТЬ")
-        close_gripper_btn.setStyleSheet(self.get_btn_style("#dc3545"))
+        close_gripper_btn = self.make_button("ЗАКРЫТЬ", "secondary")
         close_gripper_btn.clicked.connect(self.on_gripper_close)
         gripper_layout.addWidget(close_gripper_btn)
 
-        right_layout.addWidget(gripper_group)
+        layout.addWidget(gripper_group)
 
-        simulation_group = QGroupBox("СИМУЛЯЦИЯ")
+        simulation_group = QGroupBox("Симуляция")
         simulation_layout = QVBoxLayout(simulation_group)
 
-        start_sim_btn = QPushButton("ОТКРЫТЬ СИМУЛЯЦИЮ")
-        start_sim_btn.setStyleSheet(self.get_btn_style("#6f42c1"))
+        start_sim_btn = self.make_button("ОТКРЫТЬ СИМУЛЯЦИЮ", "primary")
         start_sim_btn.clicked.connect(self.on_start_gazebo)
         simulation_layout.addWidget(start_sim_btn)
 
-        stop_sim_btn = QPushButton("ОСТАНОВИТЬ СИМУЛЯЦИЮ")
-        stop_sim_btn.setStyleSheet(self.get_btn_style("#fd7e14"))
+        stop_sim_btn = self.make_button("ОСТАНОВИТЬ СИМУЛЯЦИЮ", "secondary")
         stop_sim_btn.clicked.connect(self.on_stop_gazebo)
         simulation_layout.addWidget(stop_sim_btn)
 
-        right_layout.addWidget(simulation_group)
-        right_layout.addStretch()
+        layout.addWidget(simulation_group)
+        layout.addStretch()
 
-        return right_group
+        return group
 
     def build_log_panel(self) -> QGroupBox:
-        log_group = QGroupBox("ЖУРНАЛ СОБЫТИЙ")
-        log_layout = QVBoxLayout(log_group)
+        group = QGroupBox("ЖУРНАЛ СОБЫТИЙ")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
 
         self.log_display = QPlainTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setMaximumBlockCount(200)
         self.log_display.setStyleSheet(
-            "background-color: #111111; "
-            "color: #d7ffd7; "
-            "border: 1px solid #333333; "
-            "border-radius: 4px; "
-            "padding: 8px; "
-            "font-family: Courier; "
-            "font-size: 10px;"
+            f"""
+            QPlainTextEdit {{
+                background-color: {self.COLOR_LOG};
+                color: #d7ffd7;
+                border: 1px solid {self.COLOR_BORDER};
+                border-radius: 8px;
+                padding: 8px;
+                font-family: Courier;
+                font-size: 10px;
+            }}
+            """
         )
-        log_layout.addWidget(self.log_display)
+        layout.addWidget(self.log_display)
 
-        clear_log_btn = QPushButton("ОЧИСТИТЬ ЛОГ")
-        clear_log_btn.setStyleSheet(self.get_btn_style("#555555"))
+        clear_log_btn = self.make_button("ОЧИСТИТЬ ЛОГ", "secondary")
         clear_log_btn.clicked.connect(self.clear_log)
-        log_layout.addWidget(clear_log_btn)
+        layout.addWidget(clear_log_btn)
 
-        return log_group
+        return group
 
     # ------------------------------------------------------------------
     # Styles
     # ------------------------------------------------------------------
 
-    def get_btn_style(self, color: str) -> str:
+    def base_stylesheet(self) -> str:
         return f"""
-        QPushButton {{
-            background-color: {color};
-            color: white;
-            border: 2px solid #005a9e;
-            border-radius: 8px;
+        QWidget {{
+            background-color: {self.COLOR_BG};
+            color: {self.COLOR_TEXT};
+            font-size: 11px;
+        }}
+
+        QGroupBox {{
+            background-color: {self.COLOR_PANEL};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 10px;
+            margin-top: 10px;
+            padding: 10px;
             font-weight: bold;
-            font-size: 10px;
-            padding: 7px;
         }}
-        QPushButton:hover {{
-            background-color: {color}dd;
-            border: 2px solid #0078d4;
+
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 5px;
+            color: {self.COLOR_MUTED};
         }}
-        QPushButton:pressed {{
-            background-color: {color}88;
-            border: 2px solid #005a9e;
-        }}
-        QPushButton:focus {{
-            outline: none;
-            border: 2px solid #0078d4;
+
+        QLabel {{
+            color: {self.COLOR_TEXT};
         }}
         """
 
-    @staticmethod
-    def get_title_label_style(color: str = "#0078d4") -> str:
-        return (
-            f"font-weight: bold; "
-            f"color: {color}; "
-            f"font-size: 11px; "
-            f"margin-top: 8px;"
-        )
+    def button_style(self, variant: str = "primary") -> str:
+        if variant == "danger":
+            bg = self.COLOR_DANGER
+            hover = self.COLOR_DANGER_HOVER
+            border = self.COLOR_DANGER
+        elif variant == "warning":
+            bg = self.COLOR_PANEL_2
+            hover = "#303030"
+            border = self.COLOR_WARNING
+        elif variant == "secondary":
+            bg = self.COLOR_PANEL_2
+            hover = "#303030"
+            border = self.COLOR_BORDER
+        else:
+            bg = self.COLOR_ACCENT
+            hover = self.COLOR_ACCENT_HOVER
+            border = self.COLOR_ACCENT
 
-    @staticmethod
-    def get_status_style(estop_active: bool) -> str:
-        if estop_active:
-            return (
-                "background-color: #2a0000; "
-                "color: #ffdddd; "
-                "padding: 10px; "
-                "border: 2px solid #dc3545; "
-                "border-radius: 6px; "
-                "font-family: Courier; "
-                "font-size: 10px;"
-            )
+        return f"""
+        QPushButton {{
+            background-color: {bg};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {border};
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 10px;
+            padding: 8px 12px;
+        }}
 
-        return (
-            "background-color: #1e1e1e; "
-            "color: #ffffff; "
-            "padding: 10px; "
-            "border: 2px solid #0078d4; "
-            "border-radius: 6px; "
-            "font-family: Courier; "
-            "font-size: 10px;"
+        QPushButton:hover {{
+            background-color: {hover};
+        }}
+
+        QPushButton:pressed {{
+            background-color: #0f0f0f;
+        }}
+
+        QPushButton:disabled {{
+            background-color: #333333;
+            color: #777777;
+            border: 1px solid #333333;
+        }}
+        """
+
+    def make_button(
+        self,
+        text: str,
+        variant: str = "primary",
+        width: int | None = None,
+        height: int | None = None,
+    ) -> QPushButton:
+        button = QPushButton(text)
+        button.setStyleSheet(self.button_style(variant))
+        if width is not None and height is not None:
+            button.setFixedSize(width, height)
+        return button
+
+    def section_title(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(
+            f"""
+            QLabel {{
+                color: {self.COLOR_MUTED};
+                font-weight: bold;
+                font-size: 10px;
+                margin-top: 4px;
+            }}
+            """
         )
+        return label
+
+    def info_box_style(self, monospace: bool = False) -> str:
+        font = "Courier" if monospace else "Arial"
+        return f"""
+        QLabel {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            padding: 10px;
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            font-family: {font};
+            font-size: 10px;
+        }}
+        """
+
+    def combo_style(self) -> str:
+        return f"""
+        QComboBox {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 8px;
+        }}
+
+        QComboBox:hover {{
+            border: 1px solid {self.COLOR_ACCENT};
+        }}
+
+        QComboBox::drop-down {{
+            border: none;
+        }}
+
+        QComboBox QAbstractItemView {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            selection-background-color: {self.COLOR_ACCENT};
+        }}
+        """
 
     # ------------------------------------------------------------------
     # Thread-safe ROS data buffering
     # ------------------------------------------------------------------
 
     def enqueue_ros_update(self, data: Dict[str, Any]) -> None:
-        """
-        Called by RobotBridge from ROS thread.
-
-        Do not update Qt widgets here.
-        Store only the latest packet.
-        """
         with self._ros_data_lock:
             self._latest_ros_data = data
             self._has_pending_ros_data = True
 
     def process_pending_ros_update(self) -> None:
-        """
-        Called by Qt timer from GUI thread.
-        Safe place to update widgets.
-        """
         with self._ros_data_lock:
             if not self._has_pending_ros_data:
                 return
@@ -565,6 +597,16 @@ class ManualControlUI(QWidget):
         self._dropped_log_lines = 0
         self.log_display.clear()
 
+    def toggle_logs(self) -> None:
+        self.logs_visible = not self.logs_visible
+        self.log_panel.setVisible(self.logs_visible)
+
+        if self.logs_visible:
+            self.toggle_logs_btn.setText("Скрыть логи")
+            self.append_log("Логи отображены.")
+        else:
+            self.toggle_logs_btn.setText("Показать логи")
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
@@ -603,7 +645,18 @@ class ManualControlUI(QWidget):
             f"E-STOP: {estop_text}\n"
             f"Gripper target: {gripper_target_text}"
         )
-        self.system_status_display.setStyleSheet(self.get_status_style(e_stop_active))
+
+        if e_stop_active:
+            self.system_status_display.setStyleSheet(
+                self.info_box_style()
+                + f"""
+                QLabel {{
+                    border: 1px solid {self.COLOR_DANGER};
+                }}
+                """
+            )
+        else:
+            self.system_status_display.setStyleSheet(self.info_box_style())
 
         if self.last_motion_state != motion_state:
             now = time.monotonic()
@@ -784,27 +837,6 @@ class ManualControlUI(QWidget):
         self.append_log("Команда: Reset Emergency Stop.")
         self.robot.reset_emergency_stop()
 
-    def on_check_fk_tf(self):
-        if self.robot is None:
-            return
-
-        self.append_log("Запуск проверки FK/TF.")
-
-        result = self.robot.check_fk_against_tf()
-        if result is None:
-            self.append_log("FK/TF проверка не выполнена. TF недоступен.", "WARN")
-            return
-
-        self.append_log(
-            "FK/TF: "
-            f"FK=({result['fk_x']:.4f}, {result['fk_y']:.4f}, {result['fk_z']:.4f}) m | "
-            f"TF=({result['tf_x']:.4f}, {result['tf_y']:.4f}, {result['tf_z']:.4f}) m | "
-            f"error=({result['error_x_mm']:.2f}, "
-            f"{result['error_y_mm']:.2f}, "
-            f"{result['error_z_mm']:.2f}) mm | "
-            f"total={result['error_total_mm']:.2f} mm"
-        )
-
     def on_gripper_open(self):
         if self.robot is None:
             return
@@ -883,6 +915,65 @@ class ManualControlUI(QWidget):
 
         return Path.home() / "RobotManipulator"
 
+    def find_free_gazebo_port(self, start_port: int = 11345) -> int:
+        for port in range(start_port, start_port + 100):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("127.0.0.1", port))
+                sock.close()
+                return port
+            except OSError:
+                sock.close()
+
+        return start_port
+
+    def cleanup_gazebo_processes(self) -> None:
+        """
+        Безопасная очистка Gazebo.
+
+        Важно:
+        НЕ используем pkill -f "gazebo", потому что такая команда может
+        совпасть с самой cleanup-командой и убить её раньше времени.
+
+        Вместо этого используем regex-шаблоны:
+        [g]azebo, [g]zserver, [r]os2 launch ...
+        Они находят реальные процессы, но не совпадают с собственной строкой bash.
+        """
+        cleanup_command = r"""
+        pkill -TERM -f '[r]os2 launch robot_gazebo' || true
+        pkill -TERM -f '[g]zserver' || true
+        pkill -TERM -f '[g]zclient' || true
+        pkill -TERM -f '[g]azebo' || true
+        pkill -TERM -f '[s]pawn_entity.py' || true
+        pkill -TERM -f '[s]pawner' || true
+        pkill -TERM -f '[r]os2 topic pub --once /arm_controller' || true
+        pkill -TERM -f '[r]os2 topic pub --once /gripper_controller' || true
+
+        sleep 1.5
+
+        pkill -KILL -f '[r]os2 launch robot_gazebo' || true
+        pkill -KILL -f '[g]zserver' || true
+        pkill -KILL -f '[g]zclient' || true
+        pkill -KILL -f '[g]azebo' || true
+        pkill -KILL -f '[s]pawn_entity.py' || true
+        pkill -KILL -f '[s]pawner' || true
+        pkill -KILL -f '[r]os2 topic pub --once /arm_controller' || true
+        pkill -KILL -f '[r]os2 topic pub --once /gripper_controller' || true
+
+        sleep 1.5
+        """
+
+        try:
+            subprocess.run(
+                ["bash", "-lc", cleanup_command],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception as exc:
+            self.append_log(f"Ошибка при очистке Gazebo: {exc}", "ERROR")
+
     def on_start_gazebo(self):
         if (
             self.gazebo_process is not None
@@ -890,6 +981,10 @@ class ManualControlUI(QWidget):
         ):
             self.append_log("Gazebo уже запущен.", "WARN")
             return
+
+        self.append_log("Подготовка Gazebo к запуску.")
+
+        self.cleanup_gazebo_processes()
 
         workspace_root = self.find_workspace_root()
         setup_file = workspace_root / "install" / "setup.bash"
@@ -901,8 +996,21 @@ class ManualControlUI(QWidget):
             )
             return
 
+        gazebo_port = self.find_free_gazebo_port(11345)
+        gazebo_master_uri = f"http://127.0.0.1:{gazebo_port}"
+        self.gazebo_master_uri = gazebo_master_uri
+
+        if gazebo_port == 11345:
+            self.append_log("Gazebo будет запущен на стандартном порту 11345.")
+        else:
+            self.append_log(
+                f"Порт 11345 занят. Gazebo будет запущен на порту {gazebo_port}.",
+                "WARN",
+            )
+
         command = (
             f'cd "{workspace_root}" && '
+            f"export GAZEBO_MASTER_URI={gazebo_master_uri} && "
             f"source /opt/ros/humble/setup.bash && "
             f"source install/setup.bash && "
             f"ros2 launch robot_gazebo gazebo.launch.py"
@@ -923,80 +1031,49 @@ class ManualControlUI(QWidget):
             self.append_log("Не удалось запустить Gazebo.", "ERROR")
             self.gazebo_process = None
             self.gazebo_pid = None
+            self.gazebo_master_uri = None
             return
 
         self.gazebo_pid = int(self.gazebo_process.processId())
-        self.append_log("Gazebo запускается.")
-        self.append_log("Подожди 10–15 секунд, пока загрузятся робот и контроллеры.")
+
+        self.append_log(f"Gazebo запускается. GAZEBO_MASTER_URI={gazebo_master_uri}")
+        self.append_log("Подожди 15–20 секунд, пока загрузятся робот и контроллеры.")
 
     def on_stop_gazebo(self):
         self.append_log("Остановка Gazebo.", "WARN")
         self.stop_gazebo_process()
 
     def stop_gazebo_process(self):
-        if self.gazebo_process is None:
-            self.cleanup_gazebo_processes()
-            return
+        if self.gazebo_process is not None:
+            if self.gazebo_process.state() != QProcess.ProcessState.NotRunning:
+                if self.gazebo_pid is not None:
+                    try:
+                        os.killpg(os.getpgid(self.gazebo_pid), signal.SIGTERM)
+                        self.append_log("SIGTERM отправлен группе процессов Gazebo.")
+                    except ProcessLookupError:
+                        pass
+                    except Exception as exc:
+                        self.append_log(
+                            f"Не удалось отправить SIGTERM Gazebo: {exc}",
+                            "ERROR",
+                        )
 
-        if self.gazebo_process.state() == QProcess.ProcessState.NotRunning:
-            self.cleanup_gazebo_processes()
-            self.gazebo_process = None
-            self.gazebo_pid = None
-            return
+                self.gazebo_process.waitForFinished(2000)
 
-        if self.gazebo_pid is not None:
-            try:
-                os.killpg(os.getpgid(self.gazebo_pid), signal.SIGTERM)
-                self.append_log("SIGTERM отправлен группе процессов Gazebo.")
-            except ProcessLookupError:
-                self.append_log("Группа процессов Gazebo уже завершена.")
-            except Exception as exc:
-                self.append_log(f"Не удалось остановить группу Gazebo: {exc}", "ERROR")
-
-        if not self.gazebo_process.waitForFinished(5000):
-            self.append_log("Мягкая остановка Gazebo не сработала. SIGKILL.", "WARN")
-
-            if self.gazebo_pid is not None:
-                try:
-                    os.killpg(os.getpgid(self.gazebo_pid), signal.SIGKILL)
-                    self.append_log("SIGKILL отправлен группе процессов Gazebo.")
-                except Exception as exc:
-                    self.append_log(
-                        f"Не удалось принудительно завершить Gazebo: {exc}",
-                        "ERROR",
-                    )
-
-            self.gazebo_process.kill()
-            self.gazebo_process.waitForFinished(3000)
-
-        self.cleanup_gazebo_processes()
         self.gazebo_process = None
         self.gazebo_pid = None
-        self.append_log("Gazebo остановлен.")
+        self.gazebo_master_uri = None
 
-    def cleanup_gazebo_processes(self):
-        cleanup_command = (
-            "pkill -TERM -f 'ros2 launch robot_gazebo gazebo.launch.py' || true; "
-            "pkill -TERM -f 'gzserver' || true; "
-            "pkill -TERM -f 'gzclient' || true; "
-            "pkill -TERM -f 'gazebo' || true"
-        )
+        self.cleanup_gazebo_processes()
 
-        try:
-            subprocess.run(
-                ["bash", "-lc", cleanup_command],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-                check=False,
-            )
-        except Exception as exc:
-            self.append_log(f"Ошибка при очистке Gazebo-процессов: {exc}", "ERROR")
+        self.append_log("Gazebo остановлен. Можно запускать снова.")
 
     def on_gazebo_finished(self, exit_code=0, exit_status=None):
         self.append_log(f"Процесс Gazebo завершён. exit_code={exit_code}")
+
         self.gazebo_process = None
         self.gazebo_pid = None
+        self.gazebo_master_uri = None
 
     def on_gazebo_output(self):
         if self.gazebo_process is None:
@@ -1011,14 +1088,20 @@ class ManualControlUI(QWidget):
             return
 
         important_lines = []
+
         for line in text.splitlines():
             lower = line.lower()
+
             if (
                 "error" in lower
+                or "err]" in lower
                 or "warn" in lower
                 or "failed" in lower
                 or "exception" in lower
                 or "traceback" in lower
+                or "address already in use" in lower
+                or "unable to start server" in lower
+                or "controller_manager" in lower
             ):
                 important_lines.append(line)
 
@@ -1033,5 +1116,18 @@ class ManualControlUI(QWidget):
 
         for line in important_lines[-3:]:
             lower = line.lower()
-            level = "ERROR" if "error" in lower or "failed" in lower else "WARN"
+
+            level = (
+                "ERROR"
+                if (
+                    "error" in lower
+                    or "err]" in lower
+                    or "failed" in lower
+                    or "exception" in lower
+                    or "address already in use" in lower
+                    or "unable to start server" in lower
+                )
+                else "WARN"
+            )
+
             self.append_log(f"Gazebo: {line}", level)

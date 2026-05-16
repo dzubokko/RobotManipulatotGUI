@@ -24,13 +24,12 @@ class RobotControllerApp(QMainWindow):
     """
     Главное окно приложения управления роботом-манипулятором.
 
-    По умолчанию окно открывается НЕ на весь экран.
-    Пользователь может сам развернуть окно стандартной кнопкой системы
-    или через меню "Окно".
+    Окно открывается обычным размером, чтобы работало системное
+    позиционирование окна, например Win + ← / Win + →.
     """
 
-    DEFAULT_WINDOW_WIDTH = 1280
-    DEFAULT_WINDOW_HEIGHT = 820
+    DEFAULT_WINDOW_WIDTH = 1180
+    DEFAULT_WINDOW_HEIGHT = 760
 
     MIN_WINDOW_WIDTH = 760
     MIN_WINDOW_HEIGHT = 520
@@ -94,11 +93,13 @@ class RobotControllerApp(QMainWindow):
             if self.robot_bridge is not None
             else None
         )
+
         self.editor_ui = (
             ProgramEditorUI(self.robot_bridge)
             if self.robot_bridge is not None
             else None
         )
+
         self.manager_ui = ProgramManagerUI(self.robot_bridge)
 
         if self.manual_ui is not None:
@@ -108,6 +109,11 @@ class RobotControllerApp(QMainWindow):
             self.tabs.addTab(self.editor_ui, "Редактор программы")
 
         self.tabs.addTab(self.manager_ui, "Менеджер программ")
+
+        if self.manager_ui is not None and self.editor_ui is not None:
+            self.manager_ui.program_open_requested.connect(
+                self.open_program_in_editor
+            )
 
         main_layout.addWidget(self.tabs)
         central_widget.setLayout(main_layout)
@@ -137,8 +143,7 @@ class RobotControllerApp(QMainWindow):
     def setup_window_geometry(self) -> None:
         """
         Открывает окно обычным размером и центрирует его.
-
-        Важно: здесь НЕ используется showMaximized() и НЕ используется fullscreen.
+        Здесь не используется showMaximized() и fullscreen.
         """
         screen = QApplication.primaryScreen()
 
@@ -178,6 +183,25 @@ class RobotControllerApp(QMainWindow):
         else:
             self.showMaximized()
             self.statusBar().showMessage("Окно развёрнуто", 3000)
+
+    def open_program_in_editor(self, program_name: str) -> None:
+        if self.editor_ui is None:
+            return
+
+        try:
+            self.editor_ui.load_program(program_name)
+            self.tabs.setCurrentWidget(self.editor_ui)
+            self.statusBar().showMessage(
+                f"Программа открыта в редакторе: {program_name}",
+                3000,
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка открытия программы",
+                f"Не удалось открыть программу в редакторе:\n{exc}",
+            )
 
     # ------------------------------------------------------------------
     # Styles
@@ -370,8 +394,6 @@ def main() -> None:
     app.setApplicationName("Robot Manipulator Controller")
 
     window = RobotControllerApp()
-
-    # Обычное окно, НЕ fullscreen и НЕ maximized.
     window.show()
 
     sys.exit(app.exec())

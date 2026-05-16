@@ -118,7 +118,10 @@ class RobotProgramParser:
         self.validate_commands(commands)
         return commands
 
-    def validate_source(self, source: str) -> Tuple[bool, List[str], List[ProgramCommand]]:
+    def validate_source(
+        self,
+        source: str,
+    ) -> Tuple[bool, List[str], List[ProgramCommand]]:
         try:
             commands = self.parse(source)
             messages = [f"OK: программа валидна. Команд: {len(commands)}"]
@@ -406,9 +409,7 @@ class RobotProgramParser:
                 )
 
             if duration > 3600:
-                raise ProgramParseError(
-                    f"Строка {line}: wait слишком большой."
-                )
+                raise ProgramParseError(f"Строка {line}: wait слишком большой.")
 
         elif name == "reset_home":
             self._require_arg_count_range(command, 0, 1)
@@ -548,7 +549,6 @@ class RobotProgramExecutor:
     """
     Executes parsed .robot commands.
 
-    Important design decision:
     In Gazebo the controller may not settle exactly at the target joint value.
     Therefore, motion timeout is logged as WARN and execution continues,
     unless the user requested stop or Emergency Stop is active.
@@ -769,7 +769,6 @@ class RobotProgramExecutor:
         self._check_estop()
 
         wait_timeout = max(0.5, duration + 2.0)
-
         reached = True
 
         if hasattr(self.robot, "wait_until_arm_reached"):
