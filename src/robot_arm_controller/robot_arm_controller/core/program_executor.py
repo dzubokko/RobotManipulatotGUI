@@ -10,11 +10,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 
 class ProgramParseError(Exception):
-    """Raised when .robot program syntax is invalid."""
+    pass
 
 
 class ProgramStopped(Exception):
-    """Raised when program execution is stopped by user."""
+    pass
 
 
 @dataclass
@@ -33,54 +33,10 @@ class ProgramCommand:
 
 
 class RobotProgramParser:
-    """
-    Parser and validator for .robot DSL.
-
-    Supported syntax:
-
-        move_lin(dx, dy, dz, duration)
-        rotate_rx(angle_deg, duration)
-        rotate_ry(angle_deg, duration)
-        rotate_rz(angle_deg, duration)
-
-        joint_set(index, angle_deg, duration)
-
-        wait(duration)
-        reset_home()
-        reset_home(duration)
-
-        grip_open()
-        grip_open(duration)
-        grip_close()
-        grip_close(duration)
-        grip_set(opening_m)
-        grip_set(opening_m, duration)
-
-        save_ref()
-        align_to_ref()
-        align_to_ref(duration)
-
-        stop_motion()
-
-        for i in range(3):
-            move_lin(0.01, 0, 0, 0.5)
-
-        for i in range(1, 4):
-            move_lin($i, 0, 0, 0.5)
-
-    Units:
-    - linear movement: meters;
-    - gripper opening: meters;
-    - angles: degrees;
-    - durations: seconds.
-    """
-
     NUMBER_RE = re.compile(
         r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$"
     )
-
     CALL_RE = re.compile(r"^([A-Za-z_]\w*)\s*\((.*)\)\s*$")
-
     LOOP_RE = re.compile(
         r"^for\s+([A-Za-z_]\w*)\s+in\s+range\s*\((.*?)\)\s*:\s*$"
     )
@@ -124,7 +80,10 @@ class RobotProgramParser:
     ) -> Tuple[bool, List[str], List[ProgramCommand]]:
         try:
             commands = self.parse(source)
-            messages = [f"OK: программа валидна. Команд: {len(commands)}"]
+            messages = [
+                "OK: программа валидна.",
+                f"Команд: {len(commands)}",
+            ]
             return True, messages, commands
         except ProgramParseError as exc:
             return False, [str(exc)], []
@@ -134,7 +93,6 @@ class RobotProgramParser:
 
         for line_no, raw in enumerate(source.splitlines(), start=1):
             raw = raw.replace("\t", "    ")
-
             code = raw.split("#", 1)[0].rstrip()
 
             if not code.strip():
@@ -143,7 +101,13 @@ class RobotProgramParser:
             indent = len(code) - len(code.lstrip(" "))
             text = code.strip()
 
-            result.append(SourceLine(number=line_no, indent=indent, text=text))
+            result.append(
+                SourceLine(
+                    number=line_no,
+                    indent=indent,
+                    text=text,
+                )
+            )
 
         return result
 
@@ -168,6 +132,7 @@ class RobotProgramParser:
                 )
 
             loop_match = self.LOOP_RE.match(line.text)
+
             if loop_match:
                 var_name, range_args_text = loop_match.groups()
                 range_values = self._parse_range_args(
@@ -182,6 +147,7 @@ class RobotProgramParser:
                     )
 
                 body_indent = lines[index + 1].indent
+
                 if body_indent <= line.indent:
                     raise ProgramParseError(
                         f"Строка {line.number}: тело цикла должно иметь отступ."
@@ -250,7 +216,9 @@ class RobotProgramParser:
             start, stop, step = values
 
         if step == 0:
-            raise ProgramParseError(f"Строка {line_no}: шаг range() не может быть 0.")
+            raise ProgramParseError(
+                f"Строка {line_no}: шаг range() не может быть 0."
+            )
 
         generated = list(range(start, stop, step))
 
@@ -348,17 +316,16 @@ class RobotProgramParser:
         if name == "move_lin":
             self._require_arg_count(command, 4)
             dx, dy, dz, duration = args
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
 
             if duration <= 0:
                 raise ProgramParseError(
                     f"Строка {line}: duration должен быть больше 0."
                 )
 
-            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
             if distance > 1.0:
                 raise ProgramParseError(
-                    f"Строка {line}: move_lin слишком большой ({distance:.3f} м). "
-                    f"Проверь единицы измерения."
+                    f"Строка {line}: move_lin слишком большой ({distance:.3f} м)."
                 )
 
         elif name in {"rotate_rx", "rotate_ry", "rotate_rz"}:
@@ -409,7 +376,9 @@ class RobotProgramParser:
                 )
 
             if duration > 3600:
-                raise ProgramParseError(f"Строка {line}: wait слишком большой.")
+                raise ProgramParseError(
+                    f"Строка {line}: wait слишком большой."
+                )
 
         elif name == "reset_home":
             self._require_arg_count_range(command, 0, 1)
@@ -429,7 +398,6 @@ class RobotProgramParser:
 
         elif name == "grip_set":
             self._require_arg_count_range(command, 1, 2)
-
             opening = args[0]
             duration = args[1] if len(args) > 1 else 0.7
 
@@ -546,14 +514,6 @@ class RobotProgramParser:
 
 
 class RobotProgramExecutor:
-    """
-    Executes parsed .robot commands.
-
-    In Gazebo the controller may not settle exactly at the target joint value.
-    Therefore, motion timeout is logged as WARN and execution continues,
-    unless the user requested stop or Emergency Stop is active.
-    """
-
     def __init__(
         self,
         robot,
@@ -563,11 +523,7 @@ class RobotProgramExecutor:
         self.robot = robot
         self.log_callback = log_callback
         self.progress_callback = progress_callback
-
         self._stop_event = threading.Event()
-
-        # In simulation we do not want to fail the whole program because of
-        # a small controller settling error.
         self.strict_motion_wait = False
 
     def request_stop(self) -> None:
@@ -605,24 +561,20 @@ class RobotProgramExecutor:
             if self.progress_callback is not None:
                 self.progress_callback(index, total, command)
 
-            self._log(
-                f"[{index}/{total}] Строка {command.line_no}: {command.raw}"
-            )
-
+            self._log(f"[{index}/{total}] Строка {command.line_no}: {command.raw}")
             self.execute_command(command)
 
         self._log("Программа выполнена успешно.")
 
     def execute_command(self, command: ProgramCommand) -> None:
-        name = command.name
-        args = command.args
-
         if self.robot is None:
             raise RuntimeError("RobotBridge не подключён.")
 
+        name = command.name
+        args = command.args
+
         if name == "move_lin":
             dx, dy, dz, duration = args
-
             success = self.robot.move_end_effector_world(
                 -dx,
                 -dy,
@@ -699,7 +651,6 @@ class RobotProgramExecutor:
 
         elif name == "reset_home":
             duration = args[0] if args else 2.0
-
             success = self.robot.reset_position()
 
             if not success:
@@ -714,7 +665,6 @@ class RobotProgramExecutor:
 
         elif name == "grip_open":
             duration = args[0] if args else 0.7
-
             success = self.robot.open_gripper(duration)
 
             if not success:
@@ -724,7 +674,6 @@ class RobotProgramExecutor:
 
         elif name == "grip_close":
             duration = args[0] if args else 0.7
-
             success = self.robot.close_gripper(duration)
 
             if not success:
@@ -735,7 +684,6 @@ class RobotProgramExecutor:
         elif name == "grip_set":
             opening = args[0]
             duration = args[1] if len(args) > 1 else 0.7
-
             success = self.robot.set_gripper(opening, duration)
 
             if not success:
@@ -749,7 +697,6 @@ class RobotProgramExecutor:
 
         elif name == "align_to_ref":
             duration = args[0] if args else 0.3
-
             success = self.robot.align_orientation_to_reference(duration)
 
             if not success:
@@ -784,10 +731,7 @@ class RobotProgramExecutor:
             return
 
         diagnostic = self._get_motion_error_diagnostic()
-
-        message = (
-            f"Робот не достиг целевой позиции за {wait_timeout:.2f} сек."
-        )
+        message = f"Робот не достиг целевой позиции за {wait_timeout:.2f} сек."
 
         if diagnostic:
             message += f" {diagnostic}"
@@ -824,12 +768,9 @@ class RobotProgramExecutor:
 
             max_error_rad = max(errors_rad)
             max_error_deg = math.degrees(max_error_rad)
-
             joint_index = errors_rad.index(max_error_rad) + 1
 
-            return (
-                f"Макс. ошибка: J{joint_index} = {max_error_deg:.3f}°."
-            )
+            return f"Макс. ошибка: J{joint_index} = {max_error_deg:.3f}°."
 
         except Exception:
             return ""
@@ -867,8 +808,6 @@ class RobotProgramExecutor:
 
 
 class RobotProgramStorage:
-    """Save and load .robot files."""
-
     def __init__(self, programs_dir: Path) -> None:
         self.programs_dir = programs_dir
         self.programs_dir.mkdir(parents=True, exist_ok=True)
@@ -922,10 +861,12 @@ class RobotProgramStorage:
                     return source
 
                 legacy_commands = data.get("commands")
+
                 if isinstance(legacy_commands, list):
                     return RobotProgramParser.legacy_json_commands_to_source(
                         legacy_commands
                     )
+
         except json.JSONDecodeError:
             pass
 

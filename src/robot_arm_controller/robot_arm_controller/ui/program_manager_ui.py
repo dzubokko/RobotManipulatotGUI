@@ -26,30 +26,12 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from robot_arm_controller.core.program_executor import (
-        RobotProgramParser,
-        RobotProgramStorage,
-    )
+    from robot_arm_controller.core.program_executor import RobotProgramParser
 except Exception:
     RobotProgramParser = None
-    RobotProgramStorage = None
 
 
 class ProgramManagerUI(QWidget):
-    """
-    Простой менеджер .robot-файлов.
-
-    Это версия без запуска программ из менеджера:
-    - список файлов;
-    - просмотр кода;
-    - статус валидности;
-    - описание;
-    - открыть в редакторе;
-    - импорт/экспорт;
-    - удалить;
-    - открыть папку.
-    """
-
     program_open_requested = pyqtSignal(str)
     program_deleted = pyqtSignal(str)
     program_exported = pyqtSignal(str)
@@ -64,7 +46,6 @@ class ProgramManagerUI(QWidget):
     COLOR_ACCENT_HOVER = "#1e90ff"
     COLOR_DANGER = "#d83b3b"
     COLOR_DANGER_HOVER = "#e94b4b"
-    COLOR_WARNING = "#f59f00"
     COLOR_SUCCESS = "#2da44e"
 
     def __init__(self, robot_bridge=None):
@@ -77,11 +58,6 @@ class ProgramManagerUI(QWidget):
         self.programs_dir.mkdir(parents=True, exist_ok=True)
 
         self.parser = RobotProgramParser() if RobotProgramParser is not None else None
-        self.storage = (
-            RobotProgramStorage(self.programs_dir)
-            if RobotProgramStorage is not None
-            else None
-        )
 
         self.program_data: Dict[str, Dict] = {}
         self.current_program: Optional[str] = None
@@ -94,10 +70,6 @@ class ProgramManagerUI(QWidget):
         self.refresh_programs()
 
         self.refresh_timer.start()
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
 
     def init_ui(self) -> None:
         self.setStyleSheet(self.base_stylesheet())
@@ -308,10 +280,6 @@ class ProgramManagerUI(QWidget):
 
         return group
 
-    # ------------------------------------------------------------------
-    # Styles
-    # ------------------------------------------------------------------
-
     def base_stylesheet(self) -> str:
         return f"""
         QWidget {{
@@ -450,10 +418,6 @@ class ProgramManagerUI(QWidget):
         }}
         """
 
-    # ------------------------------------------------------------------
-    # Refresh/list
-    # ------------------------------------------------------------------
-
     def refresh_programs(self) -> None:
         selected_before = self.current_program
 
@@ -481,10 +445,6 @@ class ProgramManagerUI(QWidget):
             self.table.setItem(row, 0, name_item)
 
             status_item = QTableWidgetItem(info["status"])
-            if info["status"] == "OK":
-                status_item.setForeground(Qt.GlobalColor.green)
-            else:
-                status_item.setForeground(Qt.GlobalColor.red)
             self.table.setItem(row, 1, status_item)
 
             count_item = QTableWidgetItem(str(info["command_count"]))
@@ -530,19 +490,21 @@ class ProgramManagerUI(QWidget):
                 data = json.loads(raw_text)
 
                 if isinstance(data, dict):
-                    format_name = str(data.get("format", "json"))
+                    format_name = "json"
                     description = str(data.get("description", ""))
 
-                    src = data.get("source")
-                    if isinstance(src, str):
-                        source = src
+                    source_candidate = data.get("source")
+                    if isinstance(source_candidate, str):
+                        source = source_candidate
                     else:
-                        legacy_commands = data.get("commands", [])
-                        source = self.legacy_json_commands_to_source(legacy_commands)
+                        commands_candidate = data.get("commands", [])
+                        source = self.json_commands_to_source(commands_candidate)
                 else:
+                    format_name = "json"
                     source = raw_text
 
             except json.JSONDecodeError:
+                format_name = "plain"
                 source = raw_text
 
             if self.parser is not None:
@@ -554,7 +516,6 @@ class ProgramManagerUI(QWidget):
                     status = "ERROR"
             else:
                 validation_messages = ["Парсер program_executor.py недоступен."]
-                command_count = 0
                 status = "UNKNOWN"
 
         except Exception as exc:
@@ -619,8 +580,7 @@ class ProgramManagerUI(QWidget):
             f"Формат: {info['format']}\n"
             f"Статус: {info['status']}\n"
             f"Команд: {info['command_count']}\n"
-            f"Размер: {info['size']} байт\n"
-            f"Файл: {info['path']}"
+            f"Размер: {info['size']} байт"
         )
 
         self.preview_display.setPlainText(info["source"])
@@ -640,11 +600,8 @@ class ProgramManagerUI(QWidget):
     def get_selected_program_info(self) -> Optional[Dict]:
         if not self.current_program:
             return None
-        return self.program_data.get(self.current_program)
 
-    # ------------------------------------------------------------------
-    # Description
-    # ------------------------------------------------------------------
+        return self.program_data.get(self.current_program)
 
     def save_description(self) -> None:
         info = self.get_selected_program_info()
@@ -676,7 +633,7 @@ class ProgramManagerUI(QWidget):
                 commands_json = self.commands_to_json(commands)
 
             data["name"] = info["name"]
-            data["format"] = "robot_dsl_v2"
+            data["format"] = "json"
             data["description"] = description
             data["source"] = source
             data["commands"] = commands_json
@@ -699,10 +656,6 @@ class ProgramManagerUI(QWidget):
                 f"Не удалось сохранить описание:\n{exc}",
             )
             self.description_status.setText("Ошибка сохранения")
-
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
 
     def on_open_in_editor(self) -> None:
         name = self.get_selected_program_name()
@@ -801,9 +754,7 @@ class ProgramManagerUI(QWidget):
                 if isinstance(data, dict) and isinstance(data.get("source"), str):
                     program_source = data["source"]
                 elif isinstance(data, dict) and isinstance(data.get("commands"), list):
-                    program_source = self.legacy_json_commands_to_source(
-                        data["commands"]
-                    )
+                    program_source = self.json_commands_to_source(data["commands"])
             except json.JSONDecodeError:
                 pass
 
@@ -815,6 +766,7 @@ class ProgramManagerUI(QWidget):
             if dest.exists():
                 base = dest.stem
                 counter = 1
+
                 while dest.exists():
                     dest = self.programs_dir / f"{base}_{counter}.robot"
                     counter += 1
@@ -855,10 +807,6 @@ class ProgramManagerUI(QWidget):
                 f"Не удалось открыть папку:\n{exc}",
             )
 
-    # ------------------------------------------------------------------
-    # Compatibility helpers
-    # ------------------------------------------------------------------
-
     def get_current_program(self):
         return self.get_selected_program_info()
 
@@ -875,10 +823,6 @@ class ProgramManagerUI(QWidget):
         self.refresh_timer.stop()
         event.accept()
 
-    # ------------------------------------------------------------------
-    # Utility conversion
-    # ------------------------------------------------------------------
-
     @staticmethod
     def commands_to_json(commands) -> List[Dict]:
         result = []
@@ -886,20 +830,36 @@ class ProgramManagerUI(QWidget):
         for command in commands:
             result.append(
                 {
-                    "line_no": command.line_no,
-                    "name": command.name,
-                    "args": command.args,
-                    "raw": command.raw,
+                    "line_no": int(command.line_no),
+                    "name": str(command.name),
+                    "args": [float(arg) for arg in command.args],
+                    "raw": str(command.raw),
                 }
             )
 
         return result
 
     @staticmethod
-    def legacy_json_commands_to_source(commands: List[Dict]) -> str:
+    def json_commands_to_source(commands: List[Dict]) -> str:
         lines: List[str] = []
 
         for command in commands:
+            if not isinstance(command, dict):
+                continue
+
+            raw = command.get("raw")
+            if isinstance(raw, str) and raw.strip():
+                lines.append(raw.strip())
+                continue
+
+            name = command.get("name")
+            args = command.get("args", [])
+
+            if isinstance(name, str) and isinstance(args, list):
+                args_text = ", ".join(str(arg) for arg in args)
+                lines.append(f"{name}({args_text})")
+                continue
+
             ctype = command.get("type")
 
             if ctype == "move":
@@ -948,3 +908,7 @@ class ProgramManagerUI(QWidget):
                 lines.append(f"align_to_ref({command.get('duration', 0.3)})")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def legacy_json_commands_to_source(commands: List[Dict]) -> str:
+        return ProgramManagerUI.json_commands_to_source(commands)

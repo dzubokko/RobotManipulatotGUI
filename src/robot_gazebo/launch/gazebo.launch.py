@@ -4,12 +4,7 @@ import re
 import xacro
 
 from launch import LaunchDescription
-from launch.actions import (
-    ExecuteProcess,
-    IncludeLaunchDescription,
-    SetEnvironmentVariable,
-    TimerAction,
-)
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -162,49 +157,6 @@ def generate_launch_description():
         ],
     )
 
-    # Gazebo сначала создаёт модель с суставами около нуля.
-    # Для нашей механики такая поза выглядит как "робот лежит".
-    # Поэтому после загрузки контроллеров отправляем безопасную стартовую позу.
-    send_start_home_pose = TimerAction(
-        period=15.0,
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    "ros2",
-                    "topic",
-                    "pub",
-                    "--once",
-                    "/arm_controller/joint_trajectory",
-                    "trajectory_msgs/msg/JointTrajectory",
-                    "{joint_names: ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6'], "
-                    "points: [{positions: [0.0, 0.8, -0.8, 0.0, 0.6, 0.0], "
-                    "time_from_start: {sec: 2, nanosec: 0}}]}",
-                ],
-                output="screen",
-            )
-        ],
-    )
-
-    send_start_gripper_pose = TimerAction(
-        period=15.5,
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    "ros2",
-                    "topic",
-                    "pub",
-                    "--once",
-                    "/gripper_controller/joint_trajectory",
-                    "trajectory_msgs/msg/JointTrajectory",
-                    "{joint_names: ['left_finger_joint', 'right_finger_joint'], "
-                    "points: [{positions: [0.0, 0.0], "
-                    "time_from_start: {sec: 1, nanosec: 0}}]}",
-                ],
-                output="screen",
-            )
-        ],
-    )
-
     return LaunchDescription(
         [
             gazebo_model_path,
@@ -214,7 +166,5 @@ def generate_launch_description():
             joint_state_broadcaster_spawner,
             arm_controller_spawner,
             gripper_controller_spawner,
-            send_start_home_pose,
-            send_start_gripper_pose,
         ]
     )

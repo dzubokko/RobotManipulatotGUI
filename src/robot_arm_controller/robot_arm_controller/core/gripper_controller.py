@@ -4,7 +4,6 @@ from robot_arm_controller.core.robot_model import RobotModel
 
 
 class GripperController:
-    """High-level gripper commands."""
 
     def __init__(
         self,

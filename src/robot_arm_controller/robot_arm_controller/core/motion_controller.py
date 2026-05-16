@@ -6,13 +6,7 @@ from robot_arm_controller.core.urdf_kinematics import UrdfKinematics
 
 
 class MotionController:
-    """
-    High-level arm motion logic.
-
-    This class does not create ROS publishers or subscribers. It calculates
-    joint targets and gives them to RobotBridge through callback functions.
-    """
-
+  
     def __init__(
         self,
         model: RobotModel,

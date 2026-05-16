@@ -22,19 +22,6 @@ from robot_arm_controller.core.urdf_kinematics import UrdfKinematics
 
 
 class RobotBridge(Node):
-    """
-    ROS 2 bridge between the PyQt GUI and the simulated robot.
-
-    Responsibilities of this class:
-    - ROS publishers/subscribers;
-    - ROS spinning thread;
-    - current state storage;
-    - publishing trajectory messages;
-    - compatibility methods used by the existing UI.
-
-    Kinematics and high-level motion logic are delegated to core modules.
-    """
-
     def __init__(self) -> None:
         super().__init__("robot_arm_controller")
 
@@ -42,26 +29,30 @@ class RobotBridge(Node):
         self.model.validate()
 
         self.kin = UrdfKinematics(self.model)
-
         self.lock = threading.RLock()
+
         self.current_position: List[float] = self.model.home_position.copy()
         self.current_gripper_position: List[float] = [0.0, 0.0]
 
         self.is_connected: bool = False
         self.has_joint_states: bool = False
+
         self.callbacks: List[Callable[[Dict], None]] = []
 
         self.speed_scale: float = 1.0
+
         self.last_arm_target: Optional[List[float]] = None
         self.last_gripper_target: Optional[float] = None
 
         self.motion_state: str = "idle"
         self.last_command_time: float = 0.0
         self.last_command_duration: float = 0.0
+
         self.e_stop_active: bool = False
 
         self.tf_buffer = None
         self.tf_listener = None
+
         if tf2_ros is not None:
             try:
                 self.tf_buffer = tf2_ros.Buffer()
@@ -77,11 +68,13 @@ class RobotBridge(Node):
             self.model.arm_topic,
             10,
         )
+
         self.gripper_publisher = self.create_publisher(
             JointTrajectory,
             self.model.gripper_topic,
             10,
         )
+
         self.state_subscriber = self.create_subscription(
             JointState,
             self.model.joint_states_topic,
@@ -96,6 +89,7 @@ class RobotBridge(Node):
             publish_arm_points=self._publish_arm_points,
             logger=self.get_logger(),
         )
+
         self.gripper = GripperController(
             model=self.model,
             publish_gripper_target=self._publish_gripper_target,
@@ -112,8 +106,7 @@ class RobotBridge(Node):
         self.get_logger().info(
             "RobotBridge started. "
             f"Arm topic={self.model.arm_topic}, joints={self.model.arm_joint_names}. "
-            f"Gripper topic={self.model.gripper_topic}, "
-            f"joints={self.model.gripper_joint_names}."
+            f"Gripper topic={self.model.gripper_topic}, joints={self.model.gripper_joint_names}."
         )
 
     def spin_thread(self) -> None:
@@ -122,13 +115,15 @@ class RobotBridge(Node):
                 rclpy.spin_once(self, timeout_sec=0.01)
             except Exception as exc:
                 self.get_logger().error(f"ROS spin error: {exc}")
-                time.sleep(0.05)
+
+            time.sleep(0.05)
 
     def timer_callback(self) -> None:
         self._update_motion_state()
 
     def shutdown(self) -> None:
         self.is_connected = False
+
         try:
             self.destroy_node()
         except Exception as exc:
@@ -140,6 +135,7 @@ class RobotBridge(Node):
             old_gripper = self.current_gripper_position.copy()
 
             arm_positions: List[float] = []
+
             for i, joint_name in enumerate(self.model.arm_joint_names):
                 try:
                     idx = msg.name.index(joint_name)
@@ -148,6 +144,7 @@ class RobotBridge(Node):
                     arm_positions.append(old_arm[i])
 
             gripper_positions: List[float] = []
+
             for i, joint_name in enumerate(self.model.gripper_joint_names):
                 try:
                     idx = msg.name.index(joint_name)
@@ -162,8 +159,7 @@ class RobotBridge(Node):
             self.current_gripper_position = gripper_positions
             self.has_joint_states = True
 
-        data = self.build_state_packet()
-        self.notify_callbacks(data)
+        self.notify_callbacks(self.build_state_packet())
 
     def build_state_packet(self) -> Dict:
         data: Dict = {
@@ -197,8 +193,10 @@ class RobotBridge(Node):
     @staticmethod
     def duration_from_float(duration_sec: float) -> Duration:
         duration_sec = max(0.0, float(duration_sec))
-        sec = int(duration_sec)
-        nanosec = int((duration_sec - sec) * 1e9)
+        total_nanoseconds = int(duration_sec * 1_000_000_000)
+        sec = total_nanoseconds // 1_000_000_000
+        nanosec = total_nanoseconds % 1_000_000_000
+
         return Duration(sec=sec, nanosec=nanosec)
 
     def _publish_arm_points(
@@ -208,9 +206,7 @@ class RobotBridge(Node):
         force: bool = False,
     ) -> bool:
         if not force and self.e_stop_active:
-            self.get_logger().warn(
-                "Arm command blocked because Emergency Stop is active."
-            )
+            self.get_logger().warn("Arm command blocked because Emergency Stop is active.")
             return False
 
         if not points:
@@ -225,8 +221,7 @@ class RobotBridge(Node):
         for i, q_in in enumerate(points, start=1):
             if len(q_in) != self.model.joint_count:
                 self.get_logger().error(
-                    f"Trajectory point expected {self.model.joint_count} values, "
-                    f"got {len(q_in)}"
+                    f"Trajectory point expected {self.model.joint_count} values, got {len(q_in)}"
                 )
                 return False
 
@@ -237,6 +232,7 @@ class RobotBridge(Node):
             point.time_from_start = self.duration_from_float(
                 total_duration * i / len(points)
             )
+
             traj.points.append(point)
 
         final_target = list(traj.points[-1].positions)
@@ -256,6 +252,7 @@ class RobotBridge(Node):
 
         self.trajectory_publisher.publish(traj)
         self.notify_callbacks(self.build_state_packet())
+
         return True
 
     def _publish_gripper_target(
@@ -265,9 +262,7 @@ class RobotBridge(Node):
         force: bool = False,
     ) -> bool:
         if not force and self.e_stop_active:
-            self.get_logger().warn(
-                "Gripper command blocked because Emergency Stop is active."
-            )
+            self.get_logger().warn("Gripper command blocked because Emergency Stop is active.")
             return False
 
         opening = self.model.clamp_gripper_opening(opening)
@@ -279,18 +274,19 @@ class RobotBridge(Node):
         point = JointTrajectoryPoint()
         point.positions = [opening for _ in self.model.gripper_joint_names]
         point.time_from_start = self.duration_from_float(duration_sec)
+
         traj.points.append(point)
 
         with self.lock:
             self.last_gripper_target = opening
 
         self.get_logger().info(
-            "Publishing gripper trajectory: "
-            f"opening={opening:.4f} m, duration={duration_sec:.2f}s"
+            f"Publishing gripper trajectory: opening={opening:.4f} m, duration={duration_sec:.2f}s"
         )
 
         self.gripper_publisher.publish(traj)
         self.notify_callbacks(self.build_state_packet())
+
         return True
 
     def _update_motion_state(self) -> None:
@@ -308,18 +304,25 @@ class RobotBridge(Node):
         if target is None or state not in ("moving", "timeout"):
             return
 
-        error = max(abs(current[i] - target[i]) for i in range(self.model.joint_count))
+        error = max(
+            abs(current[i] - target[i])
+            for i in range(self.model.joint_count)
+        )
+
         if error <= self.model.joint_goal_tolerance:
             with self.lock:
                 self.motion_state = "done"
+
             self.notify_callbacks(self.build_state_packet())
             return
 
         elapsed = time.monotonic() - started_at
         timeout = planned_duration + self.model.motion_timeout_margin
+
         if elapsed > timeout:
             with self.lock:
                 self.motion_state = "timeout"
+
             self.notify_callbacks(self.build_state_packet())
 
     def wait_until_arm_reached(
@@ -340,34 +343,46 @@ class RobotBridge(Node):
             timeout_sec = duration + self.model.motion_timeout_margin
 
         start = time.monotonic()
+
         while time.monotonic() - start <= timeout_sec:
             if self.e_stop_active:
                 return False
 
             current = self.get_current_position()
-            error = max(abs(current[i] - target[i]) for i in range(self.model.joint_count))
+
+            error = max(
+                abs(current[i] - target[i])
+                for i in range(self.model.joint_count)
+            )
+
             if error <= tolerance:
                 with self.lock:
                     self.motion_state = "done"
+
                 return True
 
             time.sleep(0.02)
 
         with self.lock:
             self.motion_state = "timeout"
+
         return False
 
     def stop_motion(self) -> bool:
         current = self.get_current_position()
+
         with self.lock:
             self.motion_state = "stopping"
+
         return self._publish_arm_points([current], 0.1, force=True)
 
     def emergency_stop(self) -> None:
         self.stop_motion()
+
         with self.lock:
             self.e_stop_active = True
             self.motion_state = "estop"
+
         self.get_logger().warn("Emergency Stop activated.")
         self.notify_callbacks(self.build_state_packet())
 
@@ -375,6 +390,7 @@ class RobotBridge(Node):
         with self.lock:
             self.e_stop_active = False
             self.motion_state = "idle"
+
         self.get_logger().info("Emergency Stop reset.")
         self.notify_callbacks(self.build_state_packet())
 
@@ -438,8 +454,10 @@ class RobotBridge(Node):
     ) -> bool:
         if "drx" in kwargs:
             d_rx = kwargs["drx"]
+
         if "dry" in kwargs:
             d_ry = kwargs["dry"]
+
         return self.motion.rotate_end_effector_rx_ry_ik(d_rx, d_ry, duration)
 
     def rotate_end_effector_world(
@@ -502,29 +520,33 @@ class RobotBridge(Node):
         return [x, y, z]
 
     def get_tcp_orientation(self) -> List[float]:
-        R, _ = self.forward_kinematics_full(self.get_current_position())
-        return self.kin.quaternion_from_rotation_matrix(R)
+        rotation, _ = self.forward_kinematics_full(self.get_current_position())
+        return self.kin.quaternion_from_rotation_matrix(rotation)
 
     def get_tcp_pose(self) -> Dict[str, float]:
-        q = self.get_current_position()
-        R, p = self.forward_kinematics_full(q)
+        joints = self.get_current_position()
+        rotation, position = self.forward_kinematics_full(joints)
 
-        sy = math.sqrt(R[0][0] * R[0][0] + R[1][0] * R[1][0])
+        sy = math.sqrt(
+            rotation[0][0] * rotation[0][0]
+            + rotation[1][0] * rotation[1][0]
+        )
+
         singular = sy < 1e-6
 
         if not singular:
-            rx = math.atan2(R[2][1], R[2][2])
-            ry = math.atan2(-R[2][0], sy)
-            rz = math.atan2(R[1][0], R[0][0])
+            rx = math.atan2(rotation[2][1], rotation[2][2])
+            ry = math.atan2(-rotation[2][0], sy)
+            rz = math.atan2(rotation[1][0], rotation[0][0])
         else:
-            rx = math.atan2(-R[1][2], R[1][1])
-            ry = math.atan2(-R[2][0], sy)
+            rx = math.atan2(-rotation[1][2], rotation[1][1])
+            ry = math.atan2(-rotation[2][0], sy)
             rz = 0.0
 
         return {
-            "x": -p[0],
-            "y": -p[1],
-            "z": p[2],
+            "x": -position[0],
+            "y": -position[1],
+            "z": position[2],
             "rx": math.degrees(rx),
             "ry": math.degrees(ry),
             "rz": math.degrees(rz),
@@ -546,12 +568,16 @@ class RobotBridge(Node):
             tf_y = transform.transform.translation.y
             tf_z = transform.transform.translation.z
 
-            _, fk_p = self.forward_kinematics_full(self.get_current_position())
-            fk_x, fk_y, fk_z = fk_p
+            _, fk_position = self.forward_kinematics_full(self.get_current_position())
+
+            fk_x = fk_position[0]
+            fk_y = fk_position[1]
+            fk_z = fk_position[2]
 
             dx = fk_x - tf_x
             dy = fk_y - tf_y
             dz = fk_z - tf_z
+
             error_m = math.sqrt(dx * dx + dy * dy + dz * dz)
 
             result = {

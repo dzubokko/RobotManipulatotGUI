@@ -5,7 +5,7 @@ from typing import List, Optional
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QDialog,
+    QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -33,11 +33,6 @@ from robot_arm_controller.core.program_executor import (
 class ProgramWorker(QObject):
     log_signal = pyqtSignal(str, str)
     progress_signal = pyqtSignal(int, int, str)
-
-    # status:
-    #   "success"
-    #   "stopped"
-    #   "error"
     finished_signal = pyqtSignal(str, str)
 
     def __init__(self, executor: RobotProgramExecutor, commands: List[ProgramCommand]):
@@ -56,29 +51,36 @@ class ProgramWorker(QObject):
 
 
 class ProgramEditorUI(QWidget):
-    """
-    Editor and runner for .robot programs.
+    program_saved = pyqtSignal(str)
+    program_deleted = pyqtSignal(str)
 
-    UI responsibilities:
-    - edit .robot source;
-    - validate source;
-    - save/load/delete programs;
-    - run program in a worker thread;
-    - show execution status and logs.
+    COLOR_BG = "#171717"
+    COLOR_PANEL = "#202020"
+    COLOR_PANEL_2 = "#252525"
+    COLOR_BORDER = "#3a3a3a"
+    COLOR_TEXT = "#f2f2f2"
+    COLOR_MUTED = "#a9a9a9"
+    COLOR_ACCENT = "#0a84ff"
+    COLOR_ACCENT_HOVER = "#1e90ff"
+    COLOR_DANGER = "#d83b3b"
+    COLOR_DANGER_HOVER = "#e94b4b"
+    COLOR_WARNING = "#f59f00"
+    COLOR_SUCCESS = "#2da44e"
+    COLOR_LOG = "#101010"
 
-    Core logic is implemented in core/program_executor.py.
-    """
-
-    def __init__(self, robot_controller):
+    def __init__(self, robot_bridge=None):
         super().__init__()
 
-        self.robot = robot_controller
+        self.robot_bridge = robot_bridge
 
         package_root = Path(__file__).resolve().parents[1]
         self.programs_dir = package_root / "programs"
 
         self.parser = RobotProgramParser()
         self.storage = RobotProgramStorage(self.programs_dir)
+
+        self.current_program_name: Optional[str] = None
+        self.last_valid_commands: List[ProgramCommand] = []
 
         self.executor: Optional[RobotProgramExecutor] = None
         self.worker_thread: Optional[QThread] = None
@@ -87,69 +89,60 @@ class ProgramEditorUI(QWidget):
         self.stop_requested = False
 
         self.init_ui()
-
-        self.setMinimumSize(760, 520)
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
+        self.refresh_program_list()
+        self.new_program()
 
     def init_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 8, 10, 8)
-        main_layout.setSpacing(8)
+        self.setStyleSheet(self.base_stylesheet())
 
-        title = QLabel("РЕДАКТОР .ROBOT-ПРОГРАММ")
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(10)
+
+        title = QLabel("РЕДАКТОР ПРОГРАММ")
         title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: #0078d4; margin-bottom: 4px;")
+        title.setStyleSheet(f"color: {self.COLOR_TEXT};")
         main_layout.addWidget(title)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.left_panel = self.build_left_panel()
-        self.right_panel = self.build_right_panel()
+        left_panel = self.build_left_panel()
+        right_panel = self.build_right_panel()
 
-        self.main_splitter.addWidget(self.left_panel)
-        self.main_splitter.addWidget(self.right_panel)
-
-        self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([330, 1000])
+        self.main_splitter.addWidget(left_panel)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setSizes([340, 900])
 
         main_layout.addWidget(self.main_splitter, 1)
 
+        self.setMinimumSize(760, 520)
         self.setLayout(main_layout)
 
     def build_left_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(280)
+
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 6, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         layout.addWidget(self.build_file_panel())
-        layout.addWidget(self.build_help_panel(), 1)
+        layout.addWidget(self.build_program_list_panel(), 1)
+        layout.addWidget(self.build_help_panel(), 2)
 
         return panel
 
     def build_right_panel(self) -> QWidget:
         panel = QWidget()
+
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        editor_block = self.build_editor_panel()
-        bottom_block = self.build_bottom_panel()
-
-        self.vertical_splitter.addWidget(editor_block)
-        self.vertical_splitter.addWidget(bottom_block)
-
-        self.vertical_splitter.setStretchFactor(0, 3)
-        self.vertical_splitter.setStretchFactor(1, 1)
-        self.vertical_splitter.setSizes([560, 260])
-
-        layout.addWidget(self.vertical_splitter, 1)
+        layout.addWidget(self.build_editor_panel(), 4)
+        layout.addWidget(self.build_execution_panel(), 2)
 
         return panel
 
@@ -158,570 +151,551 @@ class ProgramEditorUI(QWidget):
         layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
-        name_label = QLabel("Имя программы:")
-        layout.addWidget(name_label)
+        name_row = QHBoxLayout()
 
         self.program_name_input = QLineEdit()
-        self.program_name_input.setPlaceholderText("example_program")
-        layout.addWidget(self.program_name_input)
+        self.program_name_input.setPlaceholderText("Имя программы")
+        self.program_name_input.setStyleSheet(self.line_edit_style())
+        name_row.addWidget(self.program_name_input, 1)
 
-        buttons_row_1 = QHBoxLayout()
+        layout.addLayout(name_row)
+
+        row_1 = QHBoxLayout()
 
         new_btn = QPushButton("Новая")
-        new_btn.clicked.connect(self.on_new_program)
-        buttons_row_1.addWidget(new_btn)
-
-        open_btn = QPushButton("Открыть")
-        open_btn.clicked.connect(self.on_open_program_dialog)
-        buttons_row_1.addWidget(open_btn)
-
-        layout.addLayout(buttons_row_1)
-
-        buttons_row_2 = QHBoxLayout()
+        new_btn.clicked.connect(self.new_program)
+        new_btn.setStyleSheet(self.button_style("secondary"))
+        row_1.addWidget(new_btn)
 
         save_btn = QPushButton("Сохранить")
-        save_btn.clicked.connect(self.on_save_program)
-        save_btn.setStyleSheet(self.green_button_style())
-        buttons_row_2.addWidget(save_btn)
+        save_btn.clicked.connect(self.save_program)
+        save_btn.setStyleSheet(self.button_style("primary"))
+        row_1.addWidget(save_btn)
+
+        layout.addLayout(row_1)
+
+        row_2 = QHBoxLayout()
+
+        load_btn = QPushButton("Открыть")
+        load_btn.clicked.connect(self.load_selected_program)
+        load_btn.setStyleSheet(self.button_style("secondary"))
+        row_2.addWidget(load_btn)
 
         delete_btn = QPushButton("Удалить")
-        delete_btn.clicked.connect(self.on_delete_program)
-        delete_btn.setStyleSheet(self.red_button_style())
-        buttons_row_2.addWidget(delete_btn)
+        delete_btn.clicked.connect(self.delete_selected_program)
+        delete_btn.setStyleSheet(self.button_style("danger"))
+        row_2.addWidget(delete_btn)
 
-        layout.addLayout(buttons_row_2)
+        layout.addLayout(row_2)
+
+        return group
+
+    def build_program_list_panel(self) -> QGroupBox:
+        group = QGroupBox("СОХРАНЁННЫЕ ПРОГРАММЫ")
+        layout = QVBoxLayout(group)
+
+        self.program_list = QListWidget()
+        self.program_list.setStyleSheet(self.list_style())
+        self.program_list.itemDoubleClicked.connect(
+            lambda _: self.load_selected_program()
+        )
+        layout.addWidget(self.program_list)
 
         return group
 
     def build_help_panel(self) -> QGroupBox:
-        group = QGroupBox("СПРАВКА ПО КОМАНДАМ")
+        group = QGroupBox("КОМАНДЫ")
         layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        self.command_combo = QComboBox()
+        self.command_combo.setStyleSheet(self.combo_style())
+        self.command_combo.addItem("move_lin(dx, dy, dz, duration)")
+        self.command_combo.addItem("rotate_rx(angle_deg, duration)")
+        self.command_combo.addItem("rotate_ry(angle_deg, duration)")
+        self.command_combo.addItem("rotate_rz(angle_deg, duration)")
+        self.command_combo.addItem("joint_set(index, angle_deg, duration)")
+        self.command_combo.addItem("wait(duration)")
+        self.command_combo.addItem("reset_home()")
+        self.command_combo.addItem("grip_open()")
+        self.command_combo.addItem("grip_close()")
+        self.command_combo.addItem("grip_set(opening_m, duration)")
+        self.command_combo.addItem("save_ref()")
+        self.command_combo.addItem("align_to_ref(duration)")
+        self.command_combo.addItem("stop_motion()")
+        layout.addWidget(self.command_combo)
+
+        insert_btn = QPushButton("Вставить команду")
+        insert_btn.clicked.connect(self.insert_selected_command)
+        insert_btn.setStyleSheet(self.button_style("primary"))
+        layout.addWidget(insert_btn)
 
         self.help_display = QPlainTextEdit()
         self.help_display.setReadOnly(True)
+        self.help_display.setStyleSheet(self.text_box_style(monospace=True))
         self.help_display.setPlainText(
-            "Основные команды:\n"
-            "\n"
-            "reset_home()\n"
-            "reset_home(duration)\n"
-            "\n"
-            "move_lin(dx, dy, dz, duration)\n"
-            "  dx, dy, dz — метры\n"
-            "  duration — секунды\n"
-            "\n"
-            "rotate_rx(angle_deg, duration)\n"
-            "rotate_ry(angle_deg, duration)\n"
-            "rotate_rz(angle_deg, duration)\n"
-            "  angle_deg — градусы\n"
-            "\n"
-            "joint_set(index, angle_deg, duration)\n"
-            "  index: 1..6\n"
-            "\n"
-            "wait(duration)\n"
-            "\n"
+            "Примеры:\n\n"
+            "move_lin(0.01, 0, 0, 1.0)\n"
+            "rotate_rz(15, 1.0)\n"
+            "joint_set(2, 30, 1.5)\n"
+            "wait(1.0)\n"
             "grip_open()\n"
-            "grip_open(duration)\n"
-            "grip_close()\n"
-            "grip_close(duration)\n"
-            "grip_set(opening_m, duration)\n"
-            "  opening_m: 0..0.025\n"
-            "\n"
-            "save_ref()\n"
-            "align_to_ref(duration)\n"
-            "\n"
-            "Циклы:\n"
+            "grip_close()\n\n"
+            "Цикл:\n\n"
             "for i in range(3):\n"
-            "    move_lin(0.01, 0, 0, 0.5)\n"
-            "\n"
-            "Переменная цикла:\n"
-            "for i in range(1, 4):\n"
-            "    move_lin($i, 0, 0, 0.5)\n"
+            "    move_lin(0.01, 0, 0, 0.5)"
         )
-        self.help_display.setStyleSheet(
-            "background-color: #181818; "
-            "color: #dddddd; "
-            "font-family: Courier; "
-            "font-size: 10px; "
-            "padding: 8px; "
-            "border: 1px solid #333333; "
-            "border-radius: 4px;"
-        )
-        layout.addWidget(self.help_display)
+        layout.addWidget(self.help_display, 1)
 
         return group
 
     def build_editor_panel(self) -> QGroupBox:
         group = QGroupBox("КОД ПРОГРАММЫ")
         layout = QVBoxLayout(group)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
-        self.code_editor = QPlainTextEdit()
-        self.code_editor.setPlaceholderText(
-            "# Пример программы\n"
-            "reset_home()\n"
-            "wait(0.5)\n"
-            "\n"
-            "move_lin(0.02, 0, 0, 1.0)\n"
-            "wait(0.3)\n"
-            "\n"
-            "rotate_rz(20, 1.0)\n"
-            "wait(0.3)\n"
-            "\n"
-            "grip_open(0.7)\n"
-            "wait(0.5)\n"
-            "grip_close(0.7)\n"
+        self.editor = QPlainTextEdit()
+        self.editor.setStyleSheet(self.code_box_style())
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.editor.textChanged.connect(self.on_editor_changed)
+        layout.addWidget(self.editor, 1)
+
+        row = QHBoxLayout()
+
+        validate_btn = QPushButton("Проверить")
+        validate_btn.clicked.connect(self.validate_program)
+        validate_btn.setStyleSheet(self.button_style("primary"))
+        row.addWidget(validate_btn)
+
+        self.validation_status = QLabel("Статус: не проверено")
+        self.validation_status.setStyleSheet(
+            f"color: {self.COLOR_MUTED}; font-weight: bold;"
         )
-        self.code_editor.setStyleSheet(
-            "background-color: #2d2d2d; "
-            "color: #00ff00; "
-            "font-family: 'Courier New', monospace; "
-            "font-size: 13px; "
-            "padding: 10px; "
-            "border: 1px solid #444444; "
-            "border-radius: 4px;"
-        )
-        layout.addWidget(self.code_editor, 1)
+        row.addWidget(self.validation_status, 1)
+
+        layout.addLayout(row)
 
         self.validation_display = QPlainTextEdit()
         self.validation_display.setReadOnly(True)
-        self.validation_display.setMaximumHeight(70)
-        self.validation_display.setStyleSheet(
-            "background-color: #151515; "
-            "color: #dddddd; "
-            "font-family: Courier; "
-            "font-size: 10px; "
-            "padding: 6px; "
-            "border: 1px solid #333333; "
-            "border-radius: 4px;"
-        )
+        self.validation_display.setMaximumHeight(80)
+        self.validation_display.setStyleSheet(self.text_box_style(monospace=True))
         layout.addWidget(self.validation_display)
 
         return group
 
-    def build_bottom_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def build_execution_panel(self) -> QGroupBox:
+        group = QGroupBox("ВЫПОЛНЕНИЕ")
+        layout = QVBoxLayout(group)
         layout.setSpacing(8)
 
-        layout.addWidget(self.build_execution_panel())
-        layout.addWidget(self.build_terminal_panel())
-        layout.addWidget(self.build_log_panel(), 1)
+        row = QHBoxLayout()
 
-        return panel
+        self.run_btn = QPushButton("▶ Запустить")
+        self.run_btn.clicked.connect(self.run_program)
+        self.run_btn.setStyleSheet(self.button_style("primary"))
+        row.addWidget(self.run_btn)
 
-    def build_execution_panel(self) -> QGroupBox:
-        group = QGroupBox("ВЫПОЛНЕНИЕ ПРОГРАММЫ")
-        layout = QHBoxLayout(group)
-
-        validate_btn = QPushButton("ПРОВЕРИТЬ")
-        validate_btn.clicked.connect(self.on_validate_program)
-        validate_btn.setStyleSheet(self.blue_button_style())
-        validate_btn.setMinimumHeight(36)
-        layout.addWidget(validate_btn)
-
-        self.run_btn = QPushButton("▶ ВЫПОЛНИТЬ")
-        self.run_btn.clicked.connect(self.on_run_program)
-        self.run_btn.setStyleSheet(self.green_button_style())
-        self.run_btn.setMinimumHeight(36)
-        layout.addWidget(self.run_btn)
-
-        self.stop_btn = QPushButton("⏹ ОСТАНОВИТЬ")
-        self.stop_btn.clicked.connect(self.on_stop_program)
-        self.stop_btn.setStyleSheet(self.orange_button_style())
-        self.stop_btn.setMinimumHeight(36)
+        self.stop_btn = QPushButton("⏹ Остановить")
+        self.stop_btn.clicked.connect(self.stop_program)
         self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
+        self.stop_btn.setStyleSheet(self.button_style("secondary"))
+        row.addWidget(self.stop_btn)
 
-        self.status_label = QLabel("Статус: ожидание")
-        self.status_label.setStyleSheet(
-            "font-weight: bold; "
-            "color: #0078d4; "
-            "padding-left: 12px;"
+        clear_log_btn = QPushButton("Очистить лог")
+        clear_log_btn.clicked.connect(self.clear_log)
+        clear_log_btn.setStyleSheet(self.button_style("secondary"))
+        row.addWidget(clear_log_btn)
+
+        self.execution_status = QLabel("Статус: ожидание")
+        self.execution_status.setStyleSheet(
+            f"color: {self.COLOR_MUTED}; font-weight: bold;"
         )
-        layout.addWidget(self.status_label, 1)
+        row.addWidget(self.execution_status, 1)
 
-        return group
-
-    def build_terminal_panel(self) -> QGroupBox:
-        group = QGroupBox("ТЕРМИНАЛ ОДНОЙ КОМАНДЫ")
-        layout = QHBoxLayout(group)
-
-        self.term_input = QLineEdit()
-        self.term_input.setPlaceholderText(
-            "Например: move_lin(0.01, 0, 0, 0.5)"
-        )
-        self.term_input.returnPressed.connect(self.on_term_execute)
-        layout.addWidget(self.term_input, 1)
-
-        run_btn = QPushButton("Выполнить")
-        run_btn.clicked.connect(self.on_term_execute)
-        run_btn.setStyleSheet(self.blue_button_style())
-        layout.addWidget(run_btn)
-
-        return group
-
-    def build_log_panel(self) -> QGroupBox:
-        group = QGroupBox("ЛОГ ВЫПОЛНЕНИЯ")
-        layout = QVBoxLayout(group)
+        layout.addLayout(row)
 
         self.log_display = QPlainTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setMaximumBlockCount(500)
-        self.log_display.setStyleSheet(
-            "background-color: #111111; "
-            "color: #d7ffd7; "
-            "font-family: Courier; "
-            "font-size: 10px; "
-            "padding: 8px; "
-            "border: 1px solid #333333; "
-            "border-radius: 4px;"
-        )
+        self.log_display.setStyleSheet(self.log_box_style())
         layout.addWidget(self.log_display, 1)
-
-        clear_btn = QPushButton("Очистить лог")
-        clear_btn.clicked.connect(self.log_display.clear)
-        clear_btn.setStyleSheet(self.blue_button_style())
-        layout.addWidget(clear_btn)
 
         return group
 
-    # ------------------------------------------------------------------
-    # Styles
-    # ------------------------------------------------------------------
+    def base_stylesheet(self) -> str:
+        return f"""
+        QWidget {{
+            background-color: {self.COLOR_BG};
+            color: {self.COLOR_TEXT};
+            font-size: 11px;
+        }}
 
-    @staticmethod
-    def green_button_style() -> str:
-        return (
-            "QPushButton { "
-            "background-color: #28a745; "
-            "color: white; "
-            "font-weight: bold; "
-            "border-radius: 6px; "
-            "padding: 8px; "
-            "} "
-            "QPushButton:disabled { "
-            "background-color: #666666; "
-            "color: #bbbbbb; "
-            "}"
-        )
+        QGroupBox {{
+            background-color: {self.COLOR_PANEL};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 10px;
+            margin-top: 10px;
+            padding: 10px;
+            font-weight: bold;
+        }}
 
-    @staticmethod
-    def red_button_style() -> str:
-        return (
-            "QPushButton { "
-            "background-color: #dc3545; "
-            "color: white; "
-            "font-weight: bold; "
-            "border-radius: 6px; "
-            "padding: 8px; "
-            "} "
-            "QPushButton:disabled { "
-            "background-color: #666666; "
-            "color: #bbbbbb; "
-            "}"
-        )
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 5px;
+            color: {self.COLOR_MUTED};
+        }}
 
-    @staticmethod
-    def orange_button_style() -> str:
-        return (
-            "QPushButton { "
-            "background-color: #fd7e14; "
-            "color: white; "
-            "font-weight: bold; "
-            "border-radius: 6px; "
-            "padding: 8px; "
-            "} "
-            "QPushButton:disabled { "
-            "background-color: #666666; "
-            "color: #bbbbbb; "
-            "}"
-        )
+        QLabel {{
+            color: {self.COLOR_TEXT};
+        }}
+        """
 
-    @staticmethod
-    def blue_button_style() -> str:
-        return (
-            "QPushButton { "
-            "background-color: #0078d4; "
-            "color: white; "
-            "font-weight: bold; "
-            "border-radius: 6px; "
-            "padding: 8px; "
-            "} "
-            "QPushButton:disabled { "
-            "background-color: #666666; "
-            "color: #bbbbbb; "
-            "}"
-        )
+    def button_style(self, variant: str = "primary") -> str:
+        if variant == "danger":
+            bg = self.COLOR_DANGER
+            hover = self.COLOR_DANGER_HOVER
+            border = self.COLOR_DANGER
+        elif variant == "secondary":
+            bg = self.COLOR_PANEL_2
+            hover = "#303030"
+            border = self.COLOR_BORDER
+        else:
+            bg = self.COLOR_ACCENT
+            hover = self.COLOR_ACCENT_HOVER
+            border = self.COLOR_ACCENT
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
+        return f"""
+        QPushButton {{
+            background-color: {bg};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {border};
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 10px;
+            padding: 8px 12px;
+        }}
 
-    def log(self, message: str, level: str = "INFO") -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_display.appendPlainText(f"[{timestamp}] [{level}] {message}")
+        QPushButton:hover {{
+            background-color: {hover};
+        }}
 
-        scrollbar = self.log_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        QPushButton:pressed {{
+            background-color: #0f0f0f;
+        }}
 
-    def set_status(self, message: str, color: str = "#0078d4") -> None:
-        self.status_label.setText(f"Статус: {message}")
-        self.status_label.setStyleSheet(
-            f"font-weight: bold; "
-            f"color: {color}; "
-            f"padding-left: 12px;"
-        )
+        QPushButton:disabled {{
+            background-color: #333333;
+            color: #777777;
+            border: 1px solid #333333;
+        }}
+        """
 
-    # ------------------------------------------------------------------
-    # File operations
-    # ------------------------------------------------------------------
+    def line_edit_style(self) -> str:
+        return f"""
+        QLineEdit {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 8px;
+        }}
 
-    def on_new_program(self) -> None:
-        if self.is_running:
-            QMessageBox.warning(
-                self,
-                "Выполнение активно",
-                "Нельзя создать новую программу во время выполнения.",
-            )
-            return
+        QLineEdit:focus {{
+            border: 1px solid {self.COLOR_ACCENT};
+        }}
+        """
 
+    def list_style(self) -> str:
+        return f"""
+        QListWidget {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 6px;
+        }}
+
+        QListWidget::item {{
+            padding: 6px;
+            border-radius: 5px;
+        }}
+
+        QListWidget::item:selected {{
+            background-color: {self.COLOR_ACCENT};
+            color: white;
+        }}
+        """
+
+    def combo_style(self) -> str:
+        return f"""
+        QComboBox {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 8px;
+        }}
+
+        QComboBox:hover {{
+            border: 1px solid {self.COLOR_ACCENT};
+        }}
+
+        QComboBox::drop-down {{
+            border: none;
+        }}
+
+        QComboBox QAbstractItemView {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            selection-background-color: {self.COLOR_ACCENT};
+        }}
+        """
+
+    def text_box_style(self, monospace: bool = False) -> str:
+        font = "Courier" if monospace else "Arial"
+        return f"""
+        QPlainTextEdit {{
+            background-color: {self.COLOR_PANEL_2};
+            color: {self.COLOR_TEXT};
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 8px;
+            font-family: {font};
+            font-size: 10px;
+        }}
+        """
+
+    def code_box_style(self) -> str:
+        return f"""
+        QPlainTextEdit {{
+            background-color: {self.COLOR_PANEL_2};
+            color: #d7ffd7;
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }}
+        """
+
+    def log_box_style(self) -> str:
+        return f"""
+        QPlainTextEdit {{
+            background-color: {self.COLOR_LOG};
+            color: #d7ffd7;
+            border: 1px solid {self.COLOR_BORDER};
+            border-radius: 8px;
+            padding: 8px;
+            font-family: Courier;
+            font-size: 10px;
+        }}
+        """
+
+    def refresh_program_list(self) -> None:
+        selected_name = self.current_program_name
+
+        self.program_list.clear()
+
+        for name in self.storage.list_programs():
+            item = QListWidgetItem(name)
+            self.program_list.addItem(item)
+
+            if selected_name == name:
+                self.program_list.setCurrentItem(item)
+
+    def get_selected_program_name(self) -> Optional[str]:
+        item = self.program_list.currentItem()
+
+        if item is None:
+            return None
+
+        return item.text()
+
+    def new_program(self) -> None:
+        self.current_program_name = None
         self.program_name_input.clear()
-        self.code_editor.clear()
+        self.editor.setPlainText(
+            "reset_home()\n"
+            "wait(1.0)\n"
+            "move_lin(0.01, 0.0, 0.0, 1.0)\n"
+            "wait(1.0)\n"
+            "move_lin(-0.01, 0.0, 0.0, 1.0)\n"
+        )
         self.validation_display.clear()
+        self.validation_status.setText("Статус: не проверено")
+        self.execution_status.setText("Статус: ожидание")
         self.log("Создана новая программа.")
 
-    def on_open_program_dialog(self) -> None:
-        if self.is_running:
-            QMessageBox.warning(
-                self,
-                "Выполнение активно",
-                "Нельзя открыть программу во время выполнения.",
-            )
+    def load_selected_program(self) -> None:
+        name = self.get_selected_program_name()
+
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Выберите программу.")
             return
 
-        programs = self.storage.list_programs()
-
-        if not programs:
-            QMessageBox.information(
-                self,
-                "Нет программ",
-                "Папка программ пока пустая.",
-            )
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Открыть программу")
-        dialog.resize(400, 320)
-
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Выберите программу:"))
-
-        program_list = QListWidget()
-        for program_name in programs:
-            program_list.addItem(QListWidgetItem(program_name))
-
-        layout.addWidget(program_list)
-
-        buttons = QHBoxLayout()
-
-        open_btn = QPushButton("Открыть")
-        cancel_btn = QPushButton("Отмена")
-
-        buttons.addWidget(open_btn)
-        buttons.addWidget(cancel_btn)
-        layout.addLayout(buttons)
-
-        def open_selected() -> None:
-            item = program_list.currentItem()
-
-            if item is None:
-                return
-
-            self.load_program(item.text())
-            dialog.accept()
-
-        open_btn.clicked.connect(open_selected)
-        cancel_btn.clicked.connect(dialog.reject)
-        program_list.itemDoubleClicked.connect(lambda _: open_selected())
-
-        dialog.exec()
+        self.load_program(name)
 
     def load_program(self, program_name: str) -> None:
         try:
             source = self.storage.load_program(program_name)
-
+            self.current_program_name = program_name
             self.program_name_input.setText(program_name)
-            self.code_editor.setPlainText(source)
+            self.editor.setPlainText(source)
             self.validation_display.clear()
-
-            self.log(f"Программа загружена: {program_name}")
+            self.validation_status.setText("Статус: не проверено")
+            self.log(f"Программа открыта: {program_name}")
+            self.refresh_program_list()
 
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                "Ошибка загрузки",
-                str(exc),
+                "Ошибка открытия",
+                f"Не удалось открыть программу:\n{exc}",
             )
-            self.log(f"Ошибка загрузки: {exc}", "ERROR")
 
-    def on_save_program(self) -> None:
-        if self.is_running:
-            QMessageBox.warning(
-                self,
-                "Выполнение активно",
-                "Нельзя сохранить программу во время выполнения.",
-            )
-            return
-
+    def save_program(self) -> None:
         name = self.program_name_input.text().strip()
-        source = self.code_editor.toPlainText()
 
         if not name:
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "Введите имя программы.",
-            )
+            QMessageBox.warning(self, "Ошибка", "Введите имя программы.")
             return
 
-        if not source.strip():
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "Программа пустая.",
-            )
-            return
+        source = self.editor.toPlainText()
 
         try:
             commands = self.parser.parse(source)
-            path = self.storage.save_program(name, source, commands)
+            self.storage.save_program(name, source, commands)
 
+            self.current_program_name = name
+            self.last_valid_commands = commands
+
+            self.refresh_program_list()
+            self.program_saved.emit(name)
+
+            self.validation_status.setText("Статус: OK")
+            self.validation_status.setStyleSheet(
+                f"color: {self.COLOR_SUCCESS}; font-weight: bold;"
+            )
             self.validation_display.setPlainText(
-                f"OK: программа валидна. Команд: {len(commands)}"
+                f"OK: программа сохранена. Команд: {len(commands)}"
             )
-            self.log(f"Программа сохранена: {path}")
 
-            QMessageBox.information(
-                self,
-                "Сохранено",
-                f"Программа сохранена:\n{path}",
-            )
+            self.log(f"Программа сохранена: {name}")
 
         except ProgramParseError as exc:
-            self.validation_display.setPlainText(str(exc))
-            QMessageBox.critical(
-                self,
-                "Ошибка синтаксиса",
-                str(exc),
+            self.validation_status.setText("Статус: ошибка")
+            self.validation_status.setStyleSheet(
+                f"color: {self.COLOR_DANGER}; font-weight: bold;"
             )
-            self.log(f"Ошибка синтаксиса: {exc}", "ERROR")
+            self.validation_display.setPlainText(str(exc))
+            QMessageBox.critical(self, "Ошибка программы", str(exc))
 
         except Exception as exc:
             QMessageBox.critical(
                 self,
                 "Ошибка сохранения",
-                str(exc),
+                f"Не удалось сохранить программу:\n{exc}",
             )
-            self.log(f"Ошибка сохранения: {exc}", "ERROR")
 
-    def on_delete_program(self) -> None:
-        if self.is_running:
-            QMessageBox.warning(
-                self,
-                "Выполнение активно",
-                "Нельзя удалить программу во время выполнения.",
-            )
-            return
-
-        name = self.program_name_input.text().strip()
+    def delete_selected_program(self) -> None:
+        name = self.get_selected_program_name()
 
         if not name:
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "Введите имя программы.",
-            )
+            QMessageBox.warning(self, "Ошибка", "Выберите программу.")
             return
 
         reply = QMessageBox.question(
             self,
-            "Удалить программу?",
+            "Удаление программы",
             f"Удалить программу '{name}'?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
         if reply != QMessageBox.StandardButton.Yes:
             return
 
         try:
-            path = self.storage.delete_program(name)
+            self.storage.delete_program(name)
+            self.program_deleted.emit(name)
 
-            self.program_name_input.clear()
-            self.code_editor.clear()
-            self.validation_display.clear()
+            if self.current_program_name == name:
+                self.new_program()
 
-            self.log(f"Программа удалена: {path}")
+            self.refresh_program_list()
+            self.log(f"Программа удалена: {name}", "WARN")
 
         except Exception as exc:
             QMessageBox.critical(
                 self,
                 "Ошибка удаления",
-                str(exc),
+                f"Не удалось удалить программу:\n{exc}",
             )
-            self.log(f"Ошибка удаления: {exc}", "ERROR")
 
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
+    def insert_selected_command(self) -> None:
+        command = self.command_combo.currentText()
 
-    def on_validate_program(self) -> bool:
-        source = self.code_editor.toPlainText()
+        if not command:
+            return
+
+        cursor = self.editor.textCursor()
+        cursor.insertText(command + "\n")
+        self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+
+    def on_editor_changed(self) -> None:
+        self.validation_status.setText("Статус: изменено")
+        self.validation_status.setStyleSheet(
+            f"color: {self.COLOR_MUTED}; font-weight: bold;"
+        )
+
+    def validate_program(self) -> bool:
+        source = self.editor.toPlainText()
 
         ok, messages, commands = self.parser.validate_source(source)
 
         self.validation_display.setPlainText("\n".join(messages))
 
         if ok:
+            self.last_valid_commands = commands
+            self.validation_status.setText("Статус: OK")
+            self.validation_status.setStyleSheet(
+                f"color: {self.COLOR_SUCCESS}; font-weight: bold;"
+            )
             self.log(f"Проверка успешна. Команд: {len(commands)}")
-        else:
-            self.log("Проверка не пройдена.", "ERROR")
+            return True
 
-        return ok
+        self.last_valid_commands = []
+        self.validation_status.setText("Статус: ошибка")
+        self.validation_status.setStyleSheet(
+            f"color: {self.COLOR_DANGER}; font-weight: bold;"
+        )
+        self.log("Проверка программы не пройдена.", "ERROR")
+        return False
 
-    # ------------------------------------------------------------------
-    # Execution
-    # ------------------------------------------------------------------
-
-    def on_run_program(self) -> None:
+    def run_program(self) -> None:
         if self.is_running:
             QMessageBox.warning(
                 self,
-                "Выполнение уже идёт",
+                "Выполнение активно",
                 "Сначала остановите текущую программу.",
             )
             return
 
-        source = self.code_editor.toPlainText()
-
-        if not source.strip():
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "Программа пустая.",
-            )
-            return
+        source = self.editor.toPlainText()
 
         try:
             commands = self.parser.parse(source)
         except ProgramParseError as exc:
             self.validation_display.setPlainText(str(exc))
-            QMessageBox.critical(
-                self,
-                "Ошибка синтаксиса",
-                str(exc),
+            self.validation_status.setText("Статус: ошибка")
+            self.validation_status.setStyleSheet(
+                f"color: {self.COLOR_DANGER}; font-weight: bold;"
             )
-            self.log(f"Ошибка синтаксиса: {exc}", "ERROR")
+            QMessageBox.critical(self, "Ошибка программы", str(exc))
+            self.log(f"Ошибка запуска: {exc}", "ERROR")
             return
 
         if not commands:
@@ -732,34 +706,6 @@ class ProgramEditorUI(QWidget):
             )
             return
 
-        self.log_display.clear()
-        self.validation_display.setPlainText(
-            f"OK: программа валидна. Команд: {len(commands)}"
-        )
-
-        self.start_worker(commands)
-
-    def on_term_execute(self) -> None:
-        if self.is_running:
-            QMessageBox.warning(
-                self,
-                "Выполнение активно",
-                "Нельзя выполнить терминальную команду во время выполнения программы.",
-            )
-            return
-
-        command_text = self.term_input.text().strip()
-
-        if not command_text:
-            return
-
-        try:
-            commands = self.parser.parse(command_text)
-        except ProgramParseError as exc:
-            self.log(f"Ошибка команды: {exc}", "ERROR")
-            return
-
-        self.term_input.clear()
         self.start_worker(commands)
 
     def start_worker(self, commands: List[ProgramCommand]) -> None:
@@ -768,10 +714,12 @@ class ProgramEditorUI(QWidget):
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.set_status("выполнение", "#28a745")
+
+        self.set_execution_status("выполнение", self.COLOR_ACCENT)
+        self.log("Запуск программы.")
 
         self.executor = RobotProgramExecutor(
-            robot=self.robot,
+            robot=self.robot_bridge,
             log_callback=self.on_executor_log,
             progress_callback=self.on_executor_progress,
         )
@@ -792,23 +740,22 @@ class ProgramEditorUI(QWidget):
 
         self.worker_thread.start()
 
-    def on_stop_program(self) -> None:
+    def stop_program(self) -> None:
         if not self.is_running:
             return
 
         self.stop_requested = True
+        self.stop_btn.setEnabled(False)
 
         self.log("Остановка программы пользователем.", "WARN")
-        self.set_status("остановка...", "#fd7e14")
-
-        self.stop_btn.setEnabled(False)
+        self.set_execution_status("остановка...", self.COLOR_WARNING)
 
         if self.executor is not None:
             self.executor.request_stop()
 
         try:
-            if self.robot is not None and hasattr(self.robot, "stop_motion"):
-                self.robot.stop_motion()
+            if self.robot_bridge is not None and hasattr(self.robot_bridge, "stop_motion"):
+                self.robot_bridge.stop_motion()
         except Exception as exc:
             self.log(f"Ошибка stop_motion: {exc}", "ERROR")
 
@@ -826,7 +773,7 @@ class ProgramEditorUI(QWidget):
             self.worker.progress_signal.emit(index, total, command.raw)
 
     def on_worker_progress(self, index: int, total: int, raw: str) -> None:
-        self.set_status(f"команда {index}/{total}: {raw}", "#28a745")
+        self.set_execution_status(f"команда {index}/{total}: {raw}", self.COLOR_ACCENT)
 
     def on_worker_finished(self, status: str, message: str) -> None:
         self.is_running = False
@@ -835,22 +782,44 @@ class ProgramEditorUI(QWidget):
         self.stop_btn.setEnabled(False)
 
         if status == "success":
-            self.set_status("завершено", "#28a745")
-            self.log(message, "INFO")
+            self.set_execution_status("завершено", self.COLOR_SUCCESS)
+            self.log(message)
 
         elif status == "stopped":
-            self.set_status("остановлено", "#fd7e14")
+            self.set_execution_status("остановлено", self.COLOR_WARNING)
             self.log("Программа остановлена пользователем.", "WARN")
 
         else:
             if self.stop_requested:
-                self.set_status("остановлено", "#fd7e14")
+                self.set_execution_status("остановлено", self.COLOR_WARNING)
                 self.log("Программа остановлена пользователем.", "WARN")
             else:
-                self.set_status("ошибка", "#dc3545")
+                self.set_execution_status("ошибка", self.COLOR_DANGER)
                 self.log(message, "ERROR")
 
         self.stop_requested = False
         self.executor = None
         self.worker = None
         self.worker_thread = None
+
+    def set_execution_status(self, text: str, color: str) -> None:
+        self.execution_status.setText(f"Статус: {text}")
+        self.execution_status.setStyleSheet(
+            f"color: {color}; font-weight: bold;"
+        )
+
+    def log(self, message: str, level: str = "INFO") -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_display.appendPlainText(f"[{timestamp}] [{level}] {message}")
+
+        scrollbar = self.log_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def clear_log(self) -> None:
+        self.log_display.clear()
+
+    def closeEvent(self, event) -> None:
+        if self.is_running:
+            self.stop_program()
+
+        event.accept()

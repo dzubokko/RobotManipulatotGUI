@@ -21,27 +21,33 @@ from robot_arm_controller.ui.program_manager_ui import ProgramManagerUI
 
 
 class RobotControllerApp(QMainWindow):
-    """
-    Главное окно приложения управления роботом-манипулятором.
-
-    Окно открывается обычным размером, чтобы работало системное
-    позиционирование окна, например Win + ← / Win + →.
-    """
-
     DEFAULT_WINDOW_WIDTH = 1180
     DEFAULT_WINDOW_HEIGHT = 760
 
     MIN_WINDOW_WIDTH = 760
     MIN_WINDOW_HEIGHT = 520
 
+    COLOR_BG = "#171717"
+    COLOR_PANEL = "#202020"
+    COLOR_PANEL_2 = "#252525"
+    COLOR_BORDER = "#3a3a3a"
+    COLOR_TEXT = "#f2f2f2"
+    COLOR_MUTED = "#a9a9a9"
+    COLOR_ACCENT = "#0a84ff"
+    COLOR_ACCENT_HOVER = "#1e90ff"
+
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("Контроллер робота-манипулятора + Gazebo")
+        self.setWindowTitle("Контроллер робота-манипулятора")
         self.setMinimumSize(self.MIN_WINDOW_WIDTH, self.MIN_WINDOW_HEIGHT)
         self.setStyleSheet(self.get_stylesheet())
 
         self.robot_bridge: RobotBridge | None = None
+
+        self.manual_ui: ManualControlUI | None = None
+        self.editor_ui: ProgramEditorUI | None = None
+        self.manager_ui: ProgramManagerUI | None = None
 
         self.init_ros_bridge()
         self.init_ui()
@@ -49,12 +55,9 @@ class RobotControllerApp(QMainWindow):
         self.setup_window_geometry()
 
         self.status_timer = QTimer(self)
+        self.status_timer.setInterval(1000)
         self.status_timer.timeout.connect(self.update_status)
-        self.status_timer.start(1000)
-
-    # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
+        self.status_timer.start()
 
     def init_ros_bridge(self) -> None:
         try:
@@ -70,16 +73,15 @@ class RobotControllerApp(QMainWindow):
                 "Не удалось подключиться к ROS 2:\n"
                 f"{exc}\n\n"
                 "Проверь:\n"
-                "1) source ~/RobotManipulator/install/setup.bash\n"
-                "2) запущен Gazebo:\n"
-                "   ros2 launch robot_gazebo gazebo.launch.py\n"
-                "3) контроллеры active:\n"
-                "   ros2 control list_controllers",
+                "1) cd ~/RobotManipulator\n"
+                "2) source /opt/ros/humble/setup.bash\n"
+                "3) source install/setup.bash",
             )
             self.robot_bridge = None
 
     def init_ui(self) -> None:
         central_widget = QWidget(self)
+
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
@@ -88,17 +90,12 @@ class RobotControllerApp(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
 
-        self.manual_ui = (
-            ManualControlUI(self.robot_bridge)
-            if self.robot_bridge is not None
-            else None
-        )
-
-        self.editor_ui = (
-            ProgramEditorUI(self.robot_bridge)
-            if self.robot_bridge is not None
-            else None
-        )
+        if self.robot_bridge is not None:
+            self.manual_ui = ManualControlUI(self.robot_bridge)
+            self.editor_ui = ProgramEditorUI(self.robot_bridge)
+        else:
+            self.manual_ui = None
+            self.editor_ui = None
 
         self.manager_ui = ProgramManagerUI(self.robot_bridge)
 
@@ -115,7 +112,7 @@ class RobotControllerApp(QMainWindow):
                 self.open_program_in_editor
             )
 
-        main_layout.addWidget(self.tabs)
+        main_layout.addWidget(self.tabs, 1)
         central_widget.setLayout(main_layout)
 
         self.setCentralWidget(central_widget)
@@ -141,10 +138,6 @@ class RobotControllerApp(QMainWindow):
         window_menu.addAction(exit_action)
 
     def setup_window_geometry(self) -> None:
-        """
-        Открывает окно обычным размером и центрирует его.
-        Здесь не используется showMaximized() и fullscreen.
-        """
         screen = QApplication.primaryScreen()
 
         if screen is None:
@@ -166,10 +159,6 @@ class RobotControllerApp(QMainWindow):
 
         self.move(x, y)
 
-    # ------------------------------------------------------------------
-    # Window actions
-    # ------------------------------------------------------------------
-
     def reset_window_size(self) -> None:
         self.showNormal()
         self.setup_window_geometry()
@@ -186,6 +175,11 @@ class RobotControllerApp(QMainWindow):
 
     def open_program_in_editor(self, program_name: str) -> None:
         if self.editor_ui is None:
+            QMessageBox.warning(
+                self,
+                "Редактор недоступен",
+                "Редактор программ недоступен, потому что RobotBridge не подключён.",
+            )
             return
 
         try:
@@ -203,171 +197,161 @@ class RobotControllerApp(QMainWindow):
                 f"Не удалось открыть программу в редакторе:\n{exc}",
             )
 
-    # ------------------------------------------------------------------
-    # Styles
-    # ------------------------------------------------------------------
+    @classmethod
+    def get_stylesheet(cls) -> str:
+        return f"""
+        QMainWindow {{
+            background-color: {cls.COLOR_BG};
+            color: {cls.COLOR_TEXT};
+        }}
 
-    @staticmethod
-    def get_stylesheet() -> str:
-        return """
-        QMainWindow {
-            background-color: #1e1e1e;
-            color: #ffffff;
-        }
+        QMenuBar {{
+            background-color: {cls.COLOR_BG};
+            color: {cls.COLOR_TEXT};
+            border-bottom: 1px solid {cls.COLOR_BORDER};
+        }}
 
-        QMenuBar {
-            background-color: #1e1e1e;
-            color: #ffffff;
-            border-bottom: 1px solid #3d3d3d;
-        }
-
-        QMenuBar::item {
+        QMenuBar::item {{
             background-color: transparent;
             padding: 5px 10px;
-        }
+        }}
 
-        QMenuBar::item:selected {
-            background-color: #0078d4;
-        }
+        QMenuBar::item:selected {{
+            background-color: {cls.COLOR_ACCENT};
+        }}
 
-        QMenu {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border: 1px solid #3d3d3d;
-        }
+        QMenu {{
+            background-color: {cls.COLOR_PANEL};
+            color: {cls.COLOR_TEXT};
+            border: 1px solid {cls.COLOR_BORDER};
+        }}
 
-        QMenu::item {
+        QMenu::item {{
             padding: 6px 24px;
-        }
+        }}
 
-        QMenu::item:selected {
-            background-color: #0078d4;
-        }
+        QMenu::item:selected {{
+            background-color: {cls.COLOR_ACCENT};
+        }}
 
-        QTabWidget::pane {
-            border: 2px solid #3d3d3d;
-        }
+        QTabWidget::pane {{
+            border: 1px solid {cls.COLOR_BORDER};
+            background-color: {cls.COLOR_BG};
+        }}
 
-        QTabBar::tab {
-            background-color: #2d2d2d;
-            color: #ffffff;
+        QTabBar::tab {{
+            background-color: {cls.COLOR_PANEL};
+            color: {cls.COLOR_TEXT};
             padding: 10px 20px;
             margin: 2px;
-            border: 1px solid #3d3d3d;
+            border: 1px solid {cls.COLOR_BORDER};
+            border-radius: 8px;
             font-weight: bold;
-        }
+        }}
 
-        QTabBar::tab:selected {
-            background-color: #0078d4;
-            border: 1px solid #0078d4;
-        }
+        QTabBar::tab:selected {{
+            background-color: {cls.COLOR_ACCENT};
+            border: 1px solid {cls.COLOR_ACCENT};
+        }}
 
-        QPushButton {
-            background-color: #0078d4;
-            color: white;
-            border: none;
+        QTabBar::tab:hover {{
+            background-color: {cls.COLOR_ACCENT_HOVER};
+        }}
+
+        QPushButton {{
+            background-color: {cls.COLOR_ACCENT};
+            color: {cls.COLOR_TEXT};
+            border: 1px solid {cls.COLOR_ACCENT};
             padding: 8px 16px;
-            border-radius: 4px;
+            border-radius: 8px;
             font-weight: bold;
             font-size: 11px;
-        }
+        }}
 
-        QPushButton:hover {
-            background-color: #1084d8;
-        }
+        QPushButton:hover {{
+            background-color: {cls.COLOR_ACCENT_HOVER};
+        }}
 
-        QPushButton:pressed {
-            background-color: #005a9e;
-        }
+        QPushButton:pressed {{
+            background-color: #0f0f0f;
+        }}
 
-        QPushButton:disabled {
-            background-color: #666666;
-            color: #bbbbbb;
-        }
+        QPushButton:disabled {{
+            background-color: #333333;
+            color: #777777;
+            border: 1px solid #333333;
+        }}
 
         QLineEdit,
         QTextEdit,
-        QPlainTextEdit {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border: 1px solid #3d3d3d;
+        QPlainTextEdit {{
+            background-color: {cls.COLOR_PANEL_2};
+            color: {cls.COLOR_TEXT};
+            border: 1px solid {cls.COLOR_BORDER};
             padding: 6px;
-            border-radius: 4px;
-        }
+            border-radius: 8px;
+        }}
 
-        QLabel {
-            color: #ffffff;
-        }
+        QLabel {{
+            color: {cls.COLOR_TEXT};
+        }}
 
-        QGroupBox {
-            color: #ffffff;
-            border: 2px solid #3d3d3d;
-            border-radius: 4px;
+        QGroupBox {{
+            background-color: {cls.COLOR_PANEL};
+            color: {cls.COLOR_TEXT};
+            border: 1px solid {cls.COLOR_BORDER};
+            border-radius: 10px;
             margin-top: 10px;
             padding-top: 10px;
-        }
+            font-weight: bold;
+        }}
 
-        QGroupBox::title {
+        QGroupBox::title {{
             subcontrol-origin: margin;
             left: 10px;
-            padding: 0 3px 0 3px;
-        }
+            padding: 0 5px;
+            color: {cls.COLOR_MUTED};
+        }}
 
-        QTableWidget {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border: 1px solid #3d3d3d;
-        }
+        QTableWidget {{
+            background-color: {cls.COLOR_PANEL_2};
+            color: {cls.COLOR_TEXT};
+            border: 1px solid {cls.COLOR_BORDER};
+            gridline-color: {cls.COLOR_BORDER};
+            selection-background-color: {cls.COLOR_ACCENT};
+        }}
 
-        QHeaderView::section {
-            background-color: #0078d4;
-            color: #ffffff;
-            padding: 5px;
+        QHeaderView::section {{
+            background-color: {cls.COLOR_PANEL};
+            color: {cls.COLOR_TEXT};
+            padding: 6px;
             border: none;
+            border-bottom: 1px solid {cls.COLOR_BORDER};
             font-weight: bold;
-        }
+        }}
 
-        QSlider::groove:horizontal {
-            border: 1px solid #3d3d3d;
-            height: 8px;
-            background: #2d2d2d;
-            border-radius: 4px;
-        }
-
-        QSlider::handle:horizontal {
-            background: #0078d4;
-            border: 1px solid #0078d4;
-            width: 18px;
-            margin: -5px 0;
-            border-radius: 9px;
-        }
-
-        QStatusBar {
-            background-color: #1e1e1e;
-            color: #ffffff;
-            border-top: 1px solid #3d3d3d;
-        }
+        QStatusBar {{
+            background-color: {cls.COLOR_BG};
+            color: {cls.COLOR_TEXT};
+            border-top: 1px solid {cls.COLOR_BORDER};
+        }}
         """
-
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
 
     def update_status(self) -> None:
         if self.robot_bridge is not None and self.robot_bridge.is_connected:
-            pos = self.robot_bridge.get_current_position()
+            position = self.robot_bridge.get_current_position()
 
-            if pos:
-                j1_deg = pos[0] * 57.2957795
+            if position:
+                j1_deg = position[0] * 57.2957795
                 self.statusBar().showMessage(
                     f"Соединение: OK | J1 = {j1_deg:.1f}°"
                 )
-        else:
-            self.statusBar().showMessage("Соединение: нет подключения к RobotBridge")
+                return
 
-    # ------------------------------------------------------------------
-    # Closing
-    # ------------------------------------------------------------------
+            self.statusBar().showMessage("Соединение: OK")
+            return
+
+        self.statusBar().showMessage("Соединение: нет подключения к RobotBridge")
 
     def closeEvent(self, event) -> None:
         reply = QMessageBox.question(
@@ -375,18 +359,38 @@ class RobotControllerApp(QMainWindow):
             "Выход",
             "Вы уверены, что хотите закрыть приложение?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
-        if reply == QMessageBox.StandardButton.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
+        try:
+            if self.manual_ui is not None:
+                self.manual_ui.stop_gazebo_process()
+        except Exception:
+            pass
+
+        try:
+            if self.editor_ui is not None and getattr(self.editor_ui, "is_running", False):
+                self.editor_ui.on_stop_program()
+        except Exception:
+            pass
+
+        try:
             if self.robot_bridge is not None:
                 self.robot_bridge.shutdown()
+        except Exception:
+            pass
 
+        try:
             if rclpy.ok():
                 rclpy.shutdown()
+        except Exception:
+            pass
 
-            event.accept()
-        else:
-            event.ignore()
+        event.accept()
 
 
 def main() -> None:
