@@ -29,18 +29,6 @@ Vector3 = Tuple[float, float, float]
 
 
 class ManualControlUI(QWidget):
-    """
-    Вкладка ручного управления роботом.
-
-    Важное изменение:
-    ручное движение теперь сглажено. GUI не отправляет короткую
-    траекторию каждые 50 мс. Вместо этого используется:
-    - плавный разгон;
-    - плавное торможение;
-    - ограничение частоты команд;
-    - более длинная траектория для ros2_control/Gazebo.
-    """
-
     COLOR_BG = "#171717"
     COLOR_PANEL = "#202020"
     COLOR_PANEL_2 = "#252525"
@@ -63,9 +51,6 @@ class ManualControlUI(QWidget):
         self.gazebo_pid = None
         self.gazebo_master_uri = None
 
-        # Скорости ручного управления.
-        # linear_speed_mps — реальная скорость TCP в м/с.
-        # angular_speed_rad_s — скорость поворота TCP в рад/с.
         self.speed_levels = [
             {
                 "label": "10 мм/с",
@@ -88,15 +73,12 @@ class ManualControlUI(QWidget):
         ]
         self.speed_idx = 1
 
-        # Целевые направления от кнопок.
         self.current_move: Vector3 = (0.0, 0.0, 0.0)
         self.current_drot: Vector3 = (0.0, 0.0, 0.0)
 
-        # Сглаженные направления, которые реально отправляются роботу.
         self.smooth_move: Vector3 = (0.0, 0.0, 0.0)
         self.smooth_drot: Vector3 = (0.0, 0.0, 0.0)
 
-        # Параметры сглаживания.
         self.manual_timer_interval_ms = 40
         self.manual_send_period_sec = 0.14
         self.manual_trajectory_duration_sec = 0.40
@@ -150,10 +132,6 @@ class ManualControlUI(QWidget):
         self.append_log("GUI ручного управления запущен.")
         self.append_log("Режим ручного движения: сглаженный streaming-control.")
         self.append_log("Основной запуск проекта: python3 -m robot_arm_controller.app")
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
 
     def init_ui(self):
         self.setStyleSheet(self.base_stylesheet())
@@ -407,10 +385,6 @@ class ManualControlUI(QWidget):
 
         return group
 
-    # ------------------------------------------------------------------
-    # Styles
-    # ------------------------------------------------------------------
-
     def base_stylesheet(self) -> str:
         return f"""
         QWidget {{
@@ -553,10 +527,6 @@ class ManualControlUI(QWidget):
         }}
         """
 
-    # ------------------------------------------------------------------
-    # Thread-safe ROS data buffering
-    # ------------------------------------------------------------------
-
     def enqueue_ros_update(self, data: Dict[str, Any]) -> None:
         with self._ros_data_lock:
             self._latest_ros_data = data
@@ -578,10 +548,6 @@ class ManualControlUI(QWidget):
             self.on_ros_update(data)
         except Exception as exc:
             self.append_log(f"Ошибка обновления GUI из ROS-данных: {exc}", "ERROR")
-
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
 
     def append_log(self, message: str, level: str = "INFO") -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -639,10 +605,6 @@ class ManualControlUI(QWidget):
             self.append_log("Логи отображены.")
         else:
             self.toggle_logs_btn.setText("Показать логи")
-
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
 
     def current_speed_level(self) -> Dict[str, Any]:
         return self.speed_levels[self.speed_idx]
@@ -736,10 +698,6 @@ class ManualControlUI(QWidget):
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Smoothed manual movement
-    # ------------------------------------------------------------------
-
     @staticmethod
     def normalize_vector(dx: float, dy: float, dz: float) -> Vector3:
         length = math.sqrt(dx * dx + dy * dy + dz * dz)
@@ -778,8 +736,6 @@ class ManualControlUI(QWidget):
         self.ensure_manual_timer_running()
 
     def stop_move(self):
-        # Не вызываем stop_motion(). Просто задаём цель 0,
-        # а таймер плавно затормозит движение.
         self.current_move = (0.0, 0.0, 0.0)
 
     def start_rotate(self, drx: float, dry: float, drz: float):
@@ -791,7 +747,6 @@ class ManualControlUI(QWidget):
         self.ensure_manual_timer_running()
 
     def stop_rotate(self):
-        # Мягкое торможение поворота.
         self.current_drot = (0.0, 0.0, 0.0)
 
     def stop_all_manual_motion(self) -> None:
@@ -866,9 +821,6 @@ class ManualControlUI(QWidget):
         rot_len = self.vector_length(self.smooth_drot)
 
         try:
-            # Если одновременно зажаты движение и поворот,
-            # приоритет отдаём линейному движению, чтобы не посылать
-            # две разные траектории в один и тот же момент.
             if move_len > 1e-3:
                 dx = self.smooth_move[0] * linear_speed * send_period
                 dy = self.smooth_move[1] * linear_speed * send_period
@@ -903,10 +855,6 @@ class ManualControlUI(QWidget):
         except Exception as exc:
             self.log_manual_error_throttled(f"Ошибка ручного движения: {exc}")
             self.stop_all_manual_motion()
-
-    # ------------------------------------------------------------------
-    # Buttons
-    # ------------------------------------------------------------------
 
     def on_home(self):
         if self.robot is None:
@@ -953,10 +901,6 @@ class ManualControlUI(QWidget):
         self.append_log("Команда: закрыть захват.")
         self.robot.close_gripper(0.7)
 
-    # ------------------------------------------------------------------
-    # ROS update callback, executed only from GUI thread
-    # ------------------------------------------------------------------
-
     def on_ros_update(self, data: Dict[str, Any]):
         if "status" in data:
             self.update_system_status(data["status"])
@@ -1001,10 +945,6 @@ class ManualControlUI(QWidget):
                     f"Захват: {opening_mm:5.1f} mm | {state}"
                 )
 
-    # ------------------------------------------------------------------
-    # Gazebo
-    # ------------------------------------------------------------------
-
     def find_workspace_root(self) -> Path:
         current_file = Path(__file__).resolve()
 
@@ -1034,14 +974,6 @@ class ManualControlUI(QWidget):
         return start_port
 
     def cleanup_gazebo_processes(self) -> None:
-        """
-        Безопасная очистка Gazebo.
-
-        Важно:
-        не используем pkill -f "gazebo" напрямую, потому что такая команда
-        может совпасть с самой cleanup-командой. Используем regex-шаблоны
-        вида [g]azebo.
-        """
         cleanup_command = r"""
             pkill -TERM -f '[r]os2 launch robot_gazebo' || true
             pkill -TERM -f '[g]zserver' || true
