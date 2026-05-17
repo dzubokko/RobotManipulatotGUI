@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from PyQt6.QtCore import QProcess, QTimer
 from PyQt6.QtGui import QFont
@@ -25,22 +25,20 @@ from PyQt6.QtWidgets import (
 )
 
 
+Vector3 = Tuple[float, float, float]
+
+
 class ManualControlUI(QWidget):
     """
     Вкладка ручного управления роботом.
 
-    Возможности:
-    - ручное движение TCP по X/Y/Z;
-    - поворот TCP по RX/RY/RZ;
-    - управление захватом;
-    - запуск/остановка Gazebo;
-    - безопасная очистка Gazebo перед повторным запуском;
-    - запуск Gazebo на свободном порту, если 11345 занят;
-    - системный статус;
-    - скрываемый лог;
-    - Stop Motion;
-    - Emergency Stop;
-    - Reset E-Stop.
+    Важное изменение:
+    ручное движение теперь сглажено. GUI не отправляет короткую
+    траекторию каждые 50 мс. Вместо этого используется:
+    - плавный разгон;
+    - плавное торможение;
+    - ограничение частоты команд;
+    - более длинная траектория для ros2_control/Gazebo.
     """
 
     COLOR_BG = "#171717"
@@ -65,22 +63,52 @@ class ManualControlUI(QWidget):
         self.gazebo_pid = None
         self.gazebo_master_uri = None
 
+        # Скорости ручного управления.
+        # linear_speed_mps — реальная скорость TCP в м/с.
+        # angular_speed_rad_s — скорость поворота TCP в рад/с.
         self.speed_levels = [
-            {"label": "10 мм/с", "scale": 0.5},
-            {"label": "50 мм/с", "scale": 2.5},
-            {"label": "100 мм/с", "scale": 5.0},
+            {
+                "label": "10 мм/с",
+                "scale": 0.5,
+                "linear_speed_mps": 0.010,
+                "angular_speed_rad_s": math.radians(5.0),
+            },
+            {
+                "label": "50 мм/с",
+                "scale": 2.5,
+                "linear_speed_mps": 0.050,
+                "angular_speed_rad_s": math.radians(12.0),
+            },
+            {
+                "label": "100 мм/с",
+                "scale": 5.0,
+                "linear_speed_mps": 0.100,
+                "angular_speed_rad_s": math.radians(20.0),
+            },
         ]
         self.speed_idx = 1
 
-        self.current_move = (0.0, 0.0, 0.0)
-        self.current_drot = (0.0, 0.0, 0.0)
+        # Целевые направления от кнопок.
+        self.current_move: Vector3 = (0.0, 0.0, 0.0)
+        self.current_drot: Vector3 = (0.0, 0.0, 0.0)
 
-        self.angle_step = 0.03
+        # Сглаженные направления, которые реально отправляются роботу.
+        self.smooth_move: Vector3 = (0.0, 0.0, 0.0)
+        self.smooth_drot: Vector3 = (0.0, 0.0, 0.0)
+
+        # Параметры сглаживания.
+        self.manual_timer_interval_ms = 40
+        self.manual_send_period_sec = 0.14
+        self.manual_trajectory_duration_sec = 0.40
+        self.manual_ramp_time_sec = 0.30
+
+        self._last_manual_tick_time = time.monotonic()
+        self._last_manual_send_time = 0.0
+        self._last_manual_error_log_time = 0.0
 
         self.last_motion_state = None
         self.last_estop_state = None
         self.last_joint_states_state = None
-
         self.last_motion_log_time = 0.0
         self.last_gazebo_log_time = 0.0
 
@@ -94,13 +122,9 @@ class ManualControlUI(QWidget):
 
         self.logs_visible = True
 
-        self.move_timer = QTimer(self)
-        self.move_timer.setInterval(50)
-        self.move_timer.timeout.connect(self.on_move_timer)
-
-        self.rotate_timer = QTimer(self)
-        self.rotate_timer.setInterval(50)
-        self.rotate_timer.timeout.connect(self.on_rotate_timer)
+        self.manual_timer = QTimer(self)
+        self.manual_timer.setInterval(self.manual_timer_interval_ms)
+        self.manual_timer.timeout.connect(self.on_manual_timer)
 
         self.log_flush_timer = QTimer(self)
         self.log_flush_timer.setInterval(250)
@@ -124,6 +148,7 @@ class ManualControlUI(QWidget):
             app.aboutToQuit.connect(self.stop_gazebo_process)
 
         self.append_log("GUI ручного управления запущен.")
+        self.append_log("Режим ручного движения: сглаженный streaming-control.")
         self.append_log("Основной запуск проекта: python3 -m robot_arm_controller.app")
 
     # ------------------------------------------------------------------
@@ -142,15 +167,15 @@ class ManualControlUI(QWidget):
         title = QLabel("РУЧНОЕ УПРАВЛЕНИЕ")
         title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {self.COLOR_TEXT};")
-        header_layout.addWidget(title)
 
+        header_layout.addWidget(title)
         header_layout.addStretch()
 
         self.toggle_logs_btn = QPushButton("Скрыть логи")
         self.toggle_logs_btn.setStyleSheet(self.button_style("secondary"))
         self.toggle_logs_btn.clicked.connect(self.toggle_logs)
-        header_layout.addWidget(self.toggle_logs_btn)
 
+        header_layout.addWidget(self.toggle_logs_btn)
         main_layout.addLayout(header_layout)
 
         content = QHBoxLayout()
@@ -277,6 +302,7 @@ class ManualControlUI(QWidget):
             "E-STOP: ---"
         )
         self.system_status_display.setStyleSheet(self.info_box_style())
+
         layout.addWidget(self.section_title("Системный статус"))
         layout.addWidget(self.system_status_display)
 
@@ -285,6 +311,7 @@ class ManualControlUI(QWidget):
             "J4: 0.0° J5: 0.0° J6: 0.0°"
         )
         self.position_display.setStyleSheet(self.info_box_style(monospace=True))
+
         layout.addWidget(self.section_title("Углы суставов"))
         layout.addWidget(self.position_display)
 
@@ -293,11 +320,13 @@ class ManualControlUI(QWidget):
             "RX: ---° RY: ---° RZ: ---°"
         )
         self.pose_display.setStyleSheet(self.info_box_style(monospace=True))
+
         layout.addWidget(self.section_title("Координаты TCP"))
         layout.addWidget(self.pose_display)
 
         self.gripper_display = QLabel("Захват: --- mm")
         self.gripper_display.setStyleSheet(self.info_box_style(monospace=True))
+
         layout.addWidget(self.section_title("Захват"))
         layout.addWidget(self.gripper_display)
 
@@ -307,11 +336,12 @@ class ManualControlUI(QWidget):
         self.speed_combo = QComboBox()
         for level in self.speed_levels:
             self.speed_combo.addItem(level["label"])
+
         self.speed_combo.setCurrentIndex(self.speed_idx)
         self.speed_combo.currentIndexChanged.connect(self.on_speed_changed)
         self.speed_combo.setStyleSheet(self.combo_style())
-        speed_layout.addWidget(self.speed_combo)
 
+        speed_layout.addWidget(self.speed_combo)
         layout.addWidget(speed_group)
 
         home_btn = self.make_button("ИСХОДНАЯ ПОЗИЦИЯ", "primary")
@@ -368,6 +398,7 @@ class ManualControlUI(QWidget):
             }}
             """
         )
+
         layout.addWidget(self.log_display)
 
         clear_log_btn = self.make_button("ОЧИСТИТЬ ЛОГ", "secondary")
@@ -463,8 +494,10 @@ class ManualControlUI(QWidget):
     ) -> QPushButton:
         button = QPushButton(text)
         button.setStyleSheet(self.button_style(variant))
+
         if width is not None and height is not None:
             button.setFixedSize(width, height)
+
         return button
 
     def section_title(self, text: str) -> QLabel:
@@ -611,17 +644,24 @@ class ManualControlUI(QWidget):
     # Status
     # ------------------------------------------------------------------
 
+    def current_speed_level(self) -> Dict[str, Any]:
+        return self.speed_levels[self.speed_idx]
+
     def update_speed(self):
         if self.robot is not None:
-            self.robot.speed_scale = self.speed_levels[self.speed_idx]["scale"]
+            self.robot.speed_scale = self.current_speed_level()["scale"]
 
     def on_speed_changed(self, index: int):
         self.speed_idx = index
         self.update_speed()
 
-        label = self.speed_levels[self.speed_idx]["label"]
-        scale = self.speed_levels[self.speed_idx]["scale"]
-        self.append_log(f"Скорость изменена: {label}, scale={scale:.2f}")
+        level = self.current_speed_level()
+        self.append_log(
+            "Скорость изменена: "
+            f"{level['label']}, "
+            f"linear={level['linear_speed_mps'] * 1000.0:.0f} мм/с, "
+            f"angular={math.degrees(level['angular_speed_rad_s']):.1f} °/с"
+        )
 
     def update_system_status(self, status: Dict[str, Any]) -> None:
         connected = bool(status.get("connected", False))
@@ -665,10 +705,10 @@ class ManualControlUI(QWidget):
             if motion_state in important_motion_states:
                 self.append_log(f"Motion state: {motion_state}", "WARN")
                 self.last_motion_log_time = now
-            elif (
-                now - self.last_motion_log_time > 5.0
-                and motion_state not in {"moving", "done"}
-            ):
+            elif now - self.last_motion_log_time > 5.0 and motion_state not in {
+                "moving",
+                "done",
+            }:
                 self.append_log(f"Motion state: {motion_state}")
                 self.last_motion_log_time = now
 
@@ -697,104 +737,172 @@ class ManualControlUI(QWidget):
             return False
 
     # ------------------------------------------------------------------
-    # Movement
+    # Smoothed manual movement
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def normalize_vector(dx: float, dy: float, dz: float) -> Vector3:
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 1e-12:
+            return (0.0, 0.0, 0.0)
+
+        k = 1.0 / length
+        return (dx * k, dy * k, dz * k)
+
+    @staticmethod
+    def vector_length(v: Vector3) -> float:
+        return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+    @staticmethod
+    def approach_vector(current: Vector3, target: Vector3, alpha: float) -> Vector3:
+        alpha = max(0.0, min(1.0, alpha))
+        return (
+            current[0] + (target[0] - current[0]) * alpha,
+            current[1] + (target[1] - current[1]) * alpha,
+            current[2] + (target[2] - current[2]) * alpha,
+        )
+
+    def ensure_manual_timer_running(self) -> None:
+        if not self.manual_timer.isActive():
+            now = time.monotonic()
+            self._last_manual_tick_time = now
+            self._last_manual_send_time = 0.0
+            self.manual_timer.start()
 
     def start_move(self, dx: float, dy: float, dz: float):
         if self.is_estop_active():
             self.append_log("Движение заблокировано: активен Emergency Stop.", "WARN")
             return
 
-        length = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if length == 0.0:
-            return
-
-        k = 1.0 / length
-        self.current_move = (dx * k, dy * k, dz * k)
-
-        if not self.move_timer.isActive():
-            self.move_timer.start()
+        self.current_move = self.normalize_vector(dx, dy, dz)
+        self.ensure_manual_timer_running()
 
     def stop_move(self):
+        # Не вызываем stop_motion(). Просто задаём цель 0,
+        # а таймер плавно затормозит движение.
         self.current_move = (0.0, 0.0, 0.0)
-        self.move_timer.stop()
 
     def start_rotate(self, drx: float, dry: float, drz: float):
         if self.is_estop_active():
             self.append_log("Поворот заблокирован: активен Emergency Stop.", "WARN")
             return
 
-        length = math.sqrt(drx * drx + dry * dry + drz * drz)
-        if length == 0.0:
-            return
-
-        k = 1.0 / length
-        self.current_drot = (drx * k, dry * k, drz * k)
-
-        if not self.rotate_timer.isActive():
-            self.rotate_timer.start()
+        self.current_drot = self.normalize_vector(drx, dry, drz)
+        self.ensure_manual_timer_running()
 
     def stop_rotate(self):
+        # Мягкое торможение поворота.
         self.current_drot = (0.0, 0.0, 0.0)
-        self.rotate_timer.stop()
 
-    def on_move_timer(self):
-        dx, dy, dz = self.current_move
-        if dx == dy == dz == 0.0:
-            return
+    def stop_all_manual_motion(self) -> None:
+        self.current_move = (0.0, 0.0, 0.0)
+        self.current_drot = (0.0, 0.0, 0.0)
+        self.smooth_move = (0.0, 0.0, 0.0)
+        self.smooth_drot = (0.0, 0.0, 0.0)
+        self.manual_timer.stop()
 
+    def manual_motion_is_idle(self) -> bool:
+        return (
+            self.vector_length(self.current_move) < 1e-3
+            and self.vector_length(self.current_drot) < 1e-3
+            and self.vector_length(self.smooth_move) < 1e-3
+            and self.vector_length(self.smooth_drot) < 1e-3
+        )
+
+    def log_manual_error_throttled(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._last_manual_error_log_time >= 1.5:
+            self.append_log(message, "ERROR")
+            self._last_manual_error_log_time = now
+
+    def on_manual_timer(self):
         if self.robot is None:
+            self.stop_all_manual_motion()
             return
 
         if self.is_estop_active():
-            self.stop_move()
+            self.stop_all_manual_motion()
             return
 
-        base_step_m = 0.001
-        scaled_step_size = base_step_m * self.robot.speed_scale
+        now = time.monotonic()
+        dt = now - self._last_manual_tick_time
+        self._last_manual_tick_time = now
+
+        if dt <= 0.0:
+            dt = self.manual_timer_interval_ms / 1000.0
+
+        dt = max(0.005, min(dt, 0.12))
+
+        alpha = min(1.0, dt / self.manual_ramp_time_sec)
+
+        self.smooth_move = self.approach_vector(
+            self.smooth_move,
+            self.current_move,
+            alpha,
+        )
+        self.smooth_drot = self.approach_vector(
+            self.smooth_drot,
+            self.current_drot,
+            alpha,
+        )
+
+        if self.manual_motion_is_idle():
+            self.manual_timer.stop()
+            return
+
+        if now - self._last_manual_send_time < self.manual_send_period_sec:
+            return
+
+        self._last_manual_send_time = now
+
+        level = self.current_speed_level()
+        linear_speed = float(level["linear_speed_mps"])
+        angular_speed = float(level["angular_speed_rad_s"])
+
+        send_period = self.manual_send_period_sec
+        duration = self.manual_trajectory_duration_sec
+
+        move_len = self.vector_length(self.smooth_move)
+        rot_len = self.vector_length(self.smooth_drot)
 
         try:
-            self.robot.move_end_effector_world(
-                dx * scaled_step_size,
-                dy * scaled_step_size,
-                dz * scaled_step_size,
-                duration=0.05,
-            )
-        except Exception as exc:
-            self.append_log(f"Ошибка линейного движения: {exc}", "ERROR")
-            self.stop_move()
+            # Если одновременно зажаты движение и поворот,
+            # приоритет отдаём линейному движению, чтобы не посылать
+            # две разные траектории в один и тот же момент.
+            if move_len > 1e-3:
+                dx = self.smooth_move[0] * linear_speed * send_period
+                dy = self.smooth_move[1] * linear_speed * send_period
+                dz = self.smooth_move[2] * linear_speed * send_period
 
-    def on_rotate_timer(self):
-        drx, dry, drz = self.current_drot
-        if drx == dry == drz == 0.0:
-            return
-
-        if self.robot is None:
-            return
-
-        if self.is_estop_active():
-            self.stop_rotate()
-            return
-
-        angle_delta = self.angle_step
-
-        try:
-            if drx != 0.0 or dry != 0.0:
-                self.robot.rotate_end_effector_rx_ry_ik(
-                    drx * angle_delta,
-                    dry * angle_delta,
-                    duration=0.05,
+                self.robot.move_end_effector_world(
+                    dx,
+                    dy,
+                    dz,
+                    duration=duration,
                 )
+                return
 
-            if drz != 0.0:
-                self.robot.rotate_end_effector_world(
-                    drz * angle_delta,
-                    duration=0.05,
-                )
+            if rot_len > 1e-3:
+                drx = self.smooth_drot[0] * angular_speed * send_period
+                dry = self.smooth_drot[1] * angular_speed * send_period
+                drz = self.smooth_drot[2] * angular_speed * send_period
+
+                if abs(drx) > 1e-6 or abs(dry) > 1e-6:
+                    self.robot.rotate_end_effector_rx_ry_ik(
+                        drx,
+                        dry,
+                        duration=duration,
+                    )
+
+                if abs(drz) > 1e-6:
+                    self.robot.rotate_end_effector_world(
+                        drz,
+                        duration=duration,
+                    )
 
         except Exception as exc:
-            self.append_log(f"Ошибка углового движения: {exc}", "ERROR")
-            self.stop_rotate()
+            self.log_manual_error_throttled(f"Ошибка ручного движения: {exc}")
+            self.stop_all_manual_motion()
 
     # ------------------------------------------------------------------
     # Buttons
@@ -804,9 +912,7 @@ class ManualControlUI(QWidget):
         if self.robot is None:
             return
 
-        self.stop_move()
-        self.stop_rotate()
-
+        self.stop_all_manual_motion()
         self.append_log("Команда: переход в исходную позицию.")
         self.robot.reset_position()
 
@@ -814,9 +920,7 @@ class ManualControlUI(QWidget):
         if self.robot is None:
             return
 
-        self.stop_move()
-        self.stop_rotate()
-
+        self.stop_all_manual_motion()
         self.append_log("Команда: Stop Motion.", "WARN")
         self.robot.stop_motion()
 
@@ -824,9 +928,7 @@ class ManualControlUI(QWidget):
         if self.robot is None:
             return
 
-        self.stop_move()
-        self.stop_rotate()
-
+        self.stop_all_manual_motion()
         self.append_log("Команда: Emergency Stop.", "WARN")
         self.robot.emergency_stop()
 
@@ -908,7 +1010,11 @@ class ManualControlUI(QWidget):
 
         for parent in [current_file.parent] + list(current_file.parents):
             gazebo_launch = (
-                parent / "src" / "robot_gazebo" / "launch" / "gazebo.launch.py"
+                parent
+                / "src"
+                / "robot_gazebo"
+                / "launch"
+                / "gazebo.launch.py"
             )
             if gazebo_launch.exists():
                 return parent
@@ -932,35 +1038,29 @@ class ManualControlUI(QWidget):
         Безопасная очистка Gazebo.
 
         Важно:
-        НЕ используем pkill -f "gazebo", потому что такая команда может
-        совпасть с самой cleanup-командой и убить её раньше времени.
-
-        Вместо этого используем regex-шаблоны:
-        [g]azebo, [g]zserver, [r]os2 launch ...
-        Они находят реальные процессы, но не совпадают с собственной строкой bash.
+        не используем pkill -f "gazebo" напрямую, потому что такая команда
+        может совпасть с самой cleanup-командой. Используем regex-шаблоны
+        вида [g]azebo.
         """
         cleanup_command = r"""
-        pkill -TERM -f '[r]os2 launch robot_gazebo' || true
-        pkill -TERM -f '[g]zserver' || true
-        pkill -TERM -f '[g]zclient' || true
-        pkill -TERM -f '[g]azebo' || true
-        pkill -TERM -f '[s]pawn_entity.py' || true
-        pkill -TERM -f '[s]pawner' || true
-        pkill -TERM -f '[r]os2 topic pub --once /arm_controller' || true
-        pkill -TERM -f '[r]os2 topic pub --once /gripper_controller' || true
-
-        sleep 1.5
-
-        pkill -KILL -f '[r]os2 launch robot_gazebo' || true
-        pkill -KILL -f '[g]zserver' || true
-        pkill -KILL -f '[g]zclient' || true
-        pkill -KILL -f '[g]azebo' || true
-        pkill -KILL -f '[s]pawn_entity.py' || true
-        pkill -KILL -f '[s]pawner' || true
-        pkill -KILL -f '[r]os2 topic pub --once /arm_controller' || true
-        pkill -KILL -f '[r]os2 topic pub --once /gripper_controller' || true
-
-        sleep 1.5
+            pkill -TERM -f '[r]os2 launch robot_gazebo' || true
+            pkill -TERM -f '[g]zserver' || true
+            pkill -TERM -f '[g]zclient' || true
+            pkill -TERM -f '[g]azebo' || true
+            pkill -TERM -f '[s]pawn_entity.py' || true
+            pkill -TERM -f '[s]pawner' || true
+            pkill -TERM -f '[r]os2 topic pub --once /arm_controller' || true
+            pkill -TERM -f '[r]os2 topic pub --once /gripper_controller' || true
+            sleep 1.5
+            pkill -KILL -f '[r]os2 launch robot_gazebo' || true
+            pkill -KILL -f '[g]zserver' || true
+            pkill -KILL -f '[g]zclient' || true
+            pkill -KILL -f '[g]azebo' || true
+            pkill -KILL -f '[s]pawn_entity.py' || true
+            pkill -KILL -f '[s]pawner' || true
+            pkill -KILL -f '[r]os2 topic pub --once /arm_controller' || true
+            pkill -KILL -f '[r]os2 topic pub --once /gripper_controller' || true
+            sleep 1.5
         """
 
         try:
@@ -983,7 +1083,6 @@ class ManualControlUI(QWidget):
             return
 
         self.append_log("Подготовка Gazebo к запуску.")
-
         self.cleanup_gazebo_processes()
 
         workspace_root = self.find_workspace_root()
@@ -1065,12 +1164,10 @@ class ManualControlUI(QWidget):
         self.gazebo_master_uri = None
 
         self.cleanup_gazebo_processes()
-
         self.append_log("Gazebo остановлен. Можно запускать снова.")
 
     def on_gazebo_finished(self, exit_code=0, exit_status=None):
         self.append_log(f"Процесс Gazebo завершён. exit_code={exit_code}")
-
         self.gazebo_process = None
         self.gazebo_pid = None
         self.gazebo_master_uri = None
@@ -1116,7 +1213,6 @@ class ManualControlUI(QWidget):
 
         for line in important_lines[-3:]:
             lower = line.lower()
-
             level = (
                 "ERROR"
                 if (
@@ -1129,5 +1225,4 @@ class ManualControlUI(QWidget):
                 )
                 else "WARN"
             )
-
             self.append_log(f"Gazebo: {line}", level)
