@@ -1,14 +1,18 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 *.egg
 *.egg-info/
 dist/
 build/
 
-# IDE (ГЛАВНОЕ!)
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
 .vscode/
 .idea/
 *.swp
@@ -19,17 +23,23 @@ build/
 .DS_Store
 Thumbs.db
 
-# ROS
+# ROS 2 / colcon
 build/
-devel/
 install/
 log/
-# Локальные файлы
+
+# Local files
 *.log
 *.tmp
 .env
-
-# Большие файлы
 *.db
 *.sqlite
 *.cache
+
+# Generated ROS/TF graphs
+frames_*.gv
+frames_*.pdf
+
+# User robot programs
+src/robot_arm_controller/robot_arm_controller/programs/*.robot
+!src/robot_arm_controller/robot_arm_controller/programs/example_motion.robot
